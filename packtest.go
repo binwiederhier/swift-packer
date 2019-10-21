@@ -61,7 +61,7 @@ func main() {
 	packer := newPacker()
 
 	go func() {
-		for i := 0; i < 100000; i++ {
+		for i := 0; i < 1000; i++ {
 			//time.Sleep(20 * time.Millisecond)
 
 			// ServeHTTP
@@ -108,7 +108,12 @@ func (p *packer) group(groupId string) *packGroup {
 			responses: make(chan *http.Response),
 		}
 		p.groups[groupId] = group
-		go p.dispatch(group.requests, group.responses)
+		go func() {
+			p.dispatch(group.requests, group.responses)
+			p.Lock()
+			delete(p.groups, groupId)
+			p.Unlock()
+		}()
 	}
 
 	return group
@@ -129,10 +134,8 @@ func (p *packer) dispatch(requests chan *string, responses chan *http.Response) 
 			if pack != nil {
 				log.Printf("Dispatch: pack %d timed out\n", pack.id)
 				pack.requests <- nil
-				pack = nil
+				return
 			}
-
-			continue
 		}
 
 		if pack != nil && !more {
