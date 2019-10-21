@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -26,11 +27,11 @@ type xpack struct {
 func (p *xpack) Read(b []byte) (int, error) {
 	request := <- p.requests
 	if request == nil {
-		log.Printf("Read: pack %d -> nil request received. Closing pack\n", p.id)
+		log.Printf("Read: pack %s -> nil request received. Closing pack\n", p.id)
 		return 0, io.EOF
 	}
 
-	log.Printf("Read: pack %d -> appending %s\n", p.id, *request)
+	log.Printf("Read: pack %s -> appending %s\n", p.id, request.URL.Path)
 
 	l := rand.Intn(20)
 	p.length += l
@@ -83,7 +84,10 @@ func main() {
 				g := packer.group(group)
 				log.Printf("ServeHTTP: received %s-%s\n", group, put)
 
-				g.requests <- &http.Request{Body: ioutil.NopCloser(strings.NewReader(put))}
+				g.requests <- &http.Request{
+					URL: &url.URL{Scheme:"http", Path: "/AUTH_admin/bla/bla"},
+					Body: ioutil.NopCloser(strings.NewReader(put)),
+				}
 				log.Printf("ServeHTTP: dispatched %s-%s\n", group, put)
 				response := <- g.responses
 				log.Printf("ServeHTTP: response received for %s: %s\n", put, response.Status)
@@ -141,14 +145,14 @@ func (g *packGroup) requestHandler() {
 			break
 		case <-time.After(2000 * time.Millisecond):
 			if pack != nil {
-				log.Printf("Dispatch: pack %d timed out\n", pack.id)
+				log.Printf("Dispatch: pack %s timed out\n", pack.id)
 				pack.requests <- nil
 				return
 			}
 		}
 
 		if pack != nil && !more {
-			log.Printf("Dispatch: pack %d is full\n", pack.id)
+			log.Printf("Dispatch: pack %s is full\n", pack.id)
 			pack.requests <- nil
 			pack = nil
 		}
@@ -164,8 +168,8 @@ func (g *packGroup) requestHandler() {
 }
 
 func (g *packGroup) handlePack(apack *xpack) {
-	uri := fmt.Sprintf("http://127.0.0.1:2586/v1/AUTH_hammer%s/%s/packtest/%d", randomHexChars2(2), randomHexChars2(3), apack.id)
-	log.Printf("handlePack: pack %d -> uploading to %s\n", apack.id, uri)
+	uri := fmt.Sprintf("http://127.0.0.1:2586/v1/AUTH_hammer%s/%s/packtest/%s", randomHexChars2(2), randomHexChars2(3), apack.id)
+	log.Printf("handlePack: pack %s -> uploading to %s\n", apack.id, uri)
 
 	request, err := http.NewRequest("PUT", uri, apack)
 	if err != nil {
@@ -178,7 +182,7 @@ func (g *packGroup) handlePack(apack *xpack) {
 		panic(err)
 	}
 
-	log.Printf("handlePack: pack %d uploaded, len %d, count %d, status %s\n", apack.id, apack.length, apack.count, response.Status)
+	log.Printf("handlePack: pack %s uploaded, len %d, count %d, status %s\n", apack.id, apack.length, apack.count, response.Status)
 
 	var body []byte
 	if response.Body != nil {
