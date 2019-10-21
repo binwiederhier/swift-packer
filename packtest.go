@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,7 +17,7 @@ import (
 type xpack struct {
 	id int
 	full bool
-	requests chan *string
+	requests chan *http.Request
 	more chan bool
 	length int
 	count int
@@ -31,7 +32,8 @@ func (p *xpack) Read(b []byte) (int, error) {
 
 	log.Printf("Read: pack %d -> appending %s\n", p.id, *request)
 
-	p.length += len(*request)
+	l := rand.Intn(20)
+	p.length += l
 	p.count++
 
 	if p.length > 40 {
@@ -40,21 +42,30 @@ func (p *xpack) Read(b []byte) (int, error) {
 		p.more <-true
 	}
 
-	return len(*request), nil
+	return l, nil
 }
 
 func newPack(id int) *xpack {
 	return &xpack{
 		id: id,
 		full: false,
-		requests: make(chan *string),
+		requests: make(chan *http.Request),
 		more: make(chan bool),
 	}
 }
 
 type packGroup struct {
-	requests  chan *string
+	client *http.Client
+	requests  chan *http.Request
 	responses chan *http.Response
+}
+
+func newPackGroup(client *http.Client) *packGroup {
+	return &packGroup{
+		client:    client,
+		requests:  make(chan *http.Request),
+		responses: make(chan *http.Response),
+	}
 }
 
 func main() {
@@ -72,7 +83,7 @@ func main() {
 				g := packer.group(group)
 				log.Printf("ServeHTTP: received %s-%s\n", group, put)
 
-				g.requests <- &put
+				g.requests <- &http.Request{Body: ioutil.NopCloser(strings.NewReader(put))}
 				log.Printf("ServeHTTP: dispatched %s-%s\n", group, put)
 				response := <- g.responses
 				log.Printf("ServeHTTP: response received for %s: %s\n", put, response.Status)
@@ -87,12 +98,14 @@ func main() {
 }
 
 type packer struct {
+	client *http.Client
 	groups map[string]*packGroup
 	sync.Mutex
 }
 
 func newPacker() *packer {
 	return &packer{
+		client: &http.Client{},
 		groups: make(map[string]*packGroup, 0),
 	}
 }
@@ -103,13 +116,10 @@ func (p *packer) group(groupId string) *packGroup {
 
 	group, ok := p.groups[groupId]
 	if !ok {
-		group = &packGroup{
-			requests:  make(chan *string),
-			responses: make(chan *http.Response),
-		}
+		group = newPackGroup(p.client)
 		p.groups[groupId] = group
 		go func() {
-			p.dispatch(group.requests, group.responses)
+			group.requestHandler()
 			p.Lock()
 			delete(p.groups, groupId)
 			p.Unlock()
@@ -119,16 +129,16 @@ func (p *packer) group(groupId string) *packGroup {
 	return group
 }
 
-func (p *packer) dispatch(requests chan *string, responses chan *http.Response) {
+func (g *packGroup) requestHandler() {
 	log.Printf("Dispatch: started pack dispatch\n")
 	packId := 0
-	client := &http.Client{}
 	var pack *xpack
 	var more bool
+	var request *http.Request
+
 	for {
-		var request *string
 		select {
-		case request = <-requests:
+		case request = <-g.requests:
 			break
 		case <-time.After(2000 * time.Millisecond):
 			if pack != nil {
@@ -159,7 +169,7 @@ func (p *packer) dispatch(requests chan *string, responses chan *http.Response) 
 				}
 				request.Header.Set("X-Auth-Token", "3dd56b6df50b64af360af879fbfcea09")
 
-				response, err := client.Do(request)
+				response, err := g.client.Do(request)
 				if err != nil {
 					panic(err)
 				}
@@ -183,7 +193,7 @@ func (p *packer) dispatch(requests chan *string, responses chan *http.Response) 
 					if body != nil {
 						downResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
 					}
-					responses <- downResponse
+					g.responses <- downResponse
 				}
 			}(pack)
 		}
