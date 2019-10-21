@@ -15,7 +15,7 @@ import (
 )
 
 type xpack struct {
-	id int
+	id string
 	full bool
 	requests chan *http.Request
 	more chan bool
@@ -45,10 +45,10 @@ func (p *xpack) Read(b []byte) (int, error) {
 	return l, nil
 }
 
-func newPack(id int) *xpack {
+func newPack() *xpack {
 	return &xpack{
-		id: id,
-		full: false,
+		id:       randomHexChars2(32),
+		full:     false,
 		requests: make(chan *http.Request),
 		more: make(chan bool),
 	}
@@ -131,7 +131,6 @@ func (p *packer) group(groupId string) *packGroup {
 
 func (g *packGroup) requestHandler() {
 	log.Printf("Dispatch: started pack dispatch\n")
-	packId := 0
 	var pack *xpack
 	var more bool
 	var request *http.Request
@@ -152,54 +151,53 @@ func (g *packGroup) requestHandler() {
 			log.Printf("Dispatch: pack %d is full\n", pack.id)
 			pack.requests <- nil
 			pack = nil
-			packId++
 		}
 
 		if pack == nil {
-			pack = newPack(packId)
-
-			// handlePack
-			go func(p *xpack) {
-				uri := fmt.Sprintf("http://127.0.0.1:2586/v1/AUTH_hammer%s/%s/packtest/%d", randomHexChars2(2), randomHexChars2(3), p.id)
-				log.Printf("handlePack: pack %d -> uploading to %s\n", pack.id, uri)
-
-				request, err := http.NewRequest("PUT", uri, p)
-				if err != nil {
-					panic(err)
-				}
-				request.Header.Set("X-Auth-Token", "3dd56b6df50b64af360af879fbfcea09")
-
-				response, err := g.client.Do(request)
-				if err != nil {
-					panic(err)
-				}
-
-				log.Printf("handlePack: pack %d uploaded, len %d, count %d, status %s\n", p.id, p.length, p.count, response.Status)
-
-				var body []byte
-				if response.Body != nil {
-					body, err = ioutil.ReadAll(response.Body)
-					if err != nil {
-						panic(err)
-					}
-					if err := response.Body.Close(); err != nil {
-						panic(err)
-					}
-				}
-
-				response.Header.Add("X-Pack-Id", uri)
-				for i := 0; i < p.count; i++ {
-					downResponse := response
-					if body != nil {
-						downResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
-					}
-					g.responses <- downResponse
-				}
-			}(pack)
+			pack = newPack()
+			go g.handlePack(pack)
 		}
 
 		pack.requests <- request
 		more = <- pack.more
+	}
+}
+
+func (g *packGroup) handlePack(apack *xpack) {
+	uri := fmt.Sprintf("http://127.0.0.1:2586/v1/AUTH_hammer%s/%s/packtest/%d", randomHexChars2(2), randomHexChars2(3), apack.id)
+	log.Printf("handlePack: pack %d -> uploading to %s\n", apack.id, uri)
+
+	request, err := http.NewRequest("PUT", uri, apack)
+	if err != nil {
+		panic(err)
+	}
+	request.Header.Set("X-Auth-Token", "3dd56b6df50b64af360af879fbfcea09")
+
+	response, err := g.client.Do(request)
+	if err != nil {
+		panic(err)
+	}
+
+	log.Printf("handlePack: pack %d uploaded, len %d, count %d, status %s\n", apack.id, apack.length, apack.count, response.Status)
+
+	var body []byte
+	if response.Body != nil {
+		body, err = ioutil.ReadAll(response.Body)
+		if err != nil {
+			panic(err)
+		}
+		if err := response.Body.Close(); err != nil {
+			panic(err)
+		}
+	}
+
+	response.Header.Add("X-Pack-Id", uri)
+	for i := 0; i < apack.count; i++ {
+		downResponse := response
+		if body != nil {
+			downResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
+		}
+		g.responses <- downResponse
 	}
 }
 
