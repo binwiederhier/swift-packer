@@ -58,8 +58,7 @@ type packGroup struct {
 }
 
 func main() {
-	groups := make(map[string]*packGroup)
-	var mu sync.Mutex
+	packer := newPacker()
 
 	go func() {
 		for i := 0; i < 100000; i++ {
@@ -70,17 +69,7 @@ func main() {
 				put := fmt.Sprintf("PUT%d", v)
 				group := "default" // fmt.Sprintf("%d", rand.Intn(5))
 
-				mu.Lock()
-				g, ok := groups[group]
-				if !ok {
-					g = &packGroup{
-						requests:  make(chan *string),
-						responses: make(chan *http.Response),
-					}
-					groups[group] = g
-					go dispatch(g.requests, g.responses)
-				}
-				mu.Unlock()
+				g := packer.group(group)
 				log.Printf("ServeHTTP: received %s-%s\n", group, put)
 
 				g.requests <- &put
@@ -97,7 +86,35 @@ func main() {
 	select{}
 }
 
-func dispatch(requests chan *string, responses chan *http.Response) {
+type packer struct {
+	groups map[string]*packGroup
+	sync.Mutex
+}
+
+func newPacker() *packer {
+	return &packer{
+		groups: make(map[string]*packGroup, 0),
+	}
+}
+
+func (p *packer) group(groupId string) *packGroup {
+	p.Lock()
+	defer p.Unlock()
+
+	group, ok := p.groups[groupId]
+	if !ok {
+		group = &packGroup{
+			requests:  make(chan *string),
+			responses: make(chan *http.Response),
+		}
+		p.groups[groupId] = group
+		go p.dispatch(group.requests, group.responses)
+	}
+
+	return group
+}
+
+func (p *packer) dispatch(requests chan *string, responses chan *http.Response) {
 	log.Printf("Dispatch: started pack dispatch\n")
 	packId := 0
 	client := &http.Client{}
