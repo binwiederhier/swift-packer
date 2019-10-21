@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/http"
@@ -50,8 +52,13 @@ func newPack(id int) *xpack {
 	}
 }
 
+type packGroup struct {
+	requests  chan *string
+	responses chan *http.Response
+}
+
 func main() {
-	requests := make(map[string]chan *string)
+	groups := make(map[string]*packGroup)
 	var mu sync.Mutex
 
 	go func() {
@@ -64,17 +71,22 @@ func main() {
 				group := "default" // fmt.Sprintf("%d", rand.Intn(5))
 
 				mu.Lock()
-				ch, ok := requests[group]
+				g, ok := groups[group]
 				if !ok {
-					ch = make(chan *string)
-					requests[group] = ch
-					go dispatch(ch)
+					g = &packGroup{
+						requests:  make(chan *string),
+						responses: make(chan *http.Response),
+					}
+					groups[group] = g
+					go dispatch(g.requests, g.responses)
 				}
 				mu.Unlock()
 				log.Printf("ServeHTTP: received %s-%s\n", group, put)
 
-				ch <- &put
+				g.requests <- &put
 				log.Printf("ServeHTTP: dispatched %s-%s\n", group, put)
+				response := <- g.responses
+				log.Printf("ServeHTTP: response received for %s: %s\n", put, response.Status)
 			}(i)
 
 			runtime.Gosched()
@@ -85,7 +97,7 @@ func main() {
 	select{}
 }
 
-func dispatch(ch chan *string) {
+func dispatch(requests chan *string, responses chan *http.Response) {
 	log.Printf("Dispatch: started pack dispatch\n")
 	packId := 0
 	client := &http.Client{}
@@ -94,7 +106,7 @@ func dispatch(ch chan *string) {
 	for {
 		var request *string
 		select {
-		case request = <-ch:
+		case request = <-requests:
 			break
 		case <-time.After(2000 * time.Millisecond):
 			if pack != nil {
@@ -133,6 +145,26 @@ func dispatch(ch chan *string) {
 				}
 
 				log.Printf("handlePack: pack %d uploaded, len %d, count %d, status %s\n", p.id, p.length, p.count, response.Status)
+
+				var body []byte
+				if response.Body != nil {
+					body, err = ioutil.ReadAll(response.Body)
+					if err != nil {
+						panic(err)
+					}
+					if err := response.Body.Close(); err != nil {
+						panic(err)
+					}
+				}
+
+				response.Header.Add("X-Pack-Id", uri)
+				for i := 0; i < p.count; i++ {
+					downResponse := response
+					if body != nil {
+						downResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
+					}
+					responses <- downResponse
+				}
 			}(pack)
 		}
 
