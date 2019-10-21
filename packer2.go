@@ -18,13 +18,14 @@ import (
 type xpack struct {
 	id string
 	full bool
+	current *http.Request
 	requests chan *http.Request
 	more chan bool
 	length int
 	count int
 }
 
-func (p *xpack) Read(b []byte) (int, error) {
+func (p *xpack) Read2(b []byte) (int, error) {
 	request := <- p.requests
 	if request == nil {
 		log.Printf("Read: pack %s -> nil request received. Closing pack\n", p.id)
@@ -44,6 +45,50 @@ func (p *xpack) Read(b []byte) (int, error) {
 	}
 
 	return l, nil
+}
+
+func (p *xpack) Read(out []byte) (int, error) {
+	log.Printf("pack %s - read(%d)\n", p.id, len(out))
+	if p.current == nil {
+		p.current = <-p.requests
+		if p.current == nil {
+			log.Printf("Read: pack %s -> nil request received. Closing pack\n", p.id)
+			return 0, io.EOF
+		}
+	}
+
+	off := 0
+	for off < len(out) {
+		read, err := p.current.Body.Read(out[off:])
+		if err == io.EOF {
+			err = p.current.Body.Close()
+			if err != nil {
+				p.more <- false
+				return 0, err
+			}
+
+			off += read
+			p.length += read
+			p.current = nil
+			break
+		} else if err != nil {
+			p.more <- false
+			return 0, err
+		}
+
+		off += read
+		p.length += read
+	}
+
+	log.Printf("pack %s - read %d, total pack len %d\n", p.id, off, p.length)
+
+	if p.length > 40 {
+		p.more <- false
+	} else {
+		p.more <- true
+	}
+
+	return off, nil
 }
 
 func newPack() *xpack {
