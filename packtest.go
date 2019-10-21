@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"runtime"
 	"sync"
+	"time"
 )
 
 type xpack struct {
@@ -54,7 +55,7 @@ func main() {
 	var mu sync.Mutex
 
 	go func() {
-		for i := 0; i < 1000000; i++ {
+		for i := 0; i < 100000; i++ {
 			//time.Sleep(20 * time.Millisecond)
 
 			// ServeHTTP
@@ -90,7 +91,21 @@ func dispatch(ch chan *string) {
 	client := &http.Client{}
 	var pack *xpack
 	var more bool
-	for request := range ch {
+	for {
+		var request *string
+		select {
+		case request = <-ch:
+			break
+		case <-time.After(2000 * time.Millisecond):
+			if pack != nil {
+				log.Printf("Dispatch: pack %d timed out\n", pack.id)
+				pack.requests <- nil
+				pack = nil
+			}
+
+			continue
+		}
+
 		if pack != nil && !more {
 			log.Printf("Dispatch: pack %d is full\n", pack.id)
 			pack.requests <- nil
