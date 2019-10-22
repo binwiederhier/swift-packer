@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"math/rand"
 	"net/http"
 	"regexp"
@@ -76,16 +75,17 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 
 	// Fetch group and queue request
 	group := p.group(groupId)
-	log.Printf("ServeHTTP: received request %s (group %s)\n", request.URL.Path, groupId)
+	debugf("group %s - pack n/a    - handlePut - request %s - received\n", groupId, request.URL.Path)
 
 	group.requests <- request
-	log.Printf("ServeHTTP: dispatched request %s (group %s)\n", request.URL.Path, groupId)
+	debugf("group %s - pack n/a    - handlePut - request %s - dispatched\n", groupId, request.URL.Path)
 	response := <-group.responses
-	log.Printf("ServeHTTP: response received for %s: %s (group %s)\n", request.URL.Path, response.Status, groupId)
+	debugf("group %s - pack n/a    - handlePut - request %s - response received: %s\n",
+		groupId, request.URL.Path, response.Status)
 
 	copyAndWriteResponseHeader(w, response)
 	if err := writeResponse(w, response); err != nil {
-		log.Printf("Cannot write response: " + err.Error())
+		debugf("Cannot write response: " + err.Error())
 	}
 }
 
@@ -110,7 +110,7 @@ func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
 
 	copyAndWriteResponseHeader(w, proxyResponse)
 	if err := writeResponse(w, proxyResponse); err != nil {
-		log.Printf("Cannot write response to forwarded request: " + err.Error())
+		debugf("Cannot write response to forwarded request: " + err.Error())
 	}
 }
 
@@ -125,7 +125,8 @@ func (p *packer) group(groupId string) *packGroup {
 
 	group, ok := p.groups[groupId]
 	if !ok {
-		group = newPackGroup(p.config, p.client)
+		debugf("group %s - group - NEW\n", groupId)
+		group = newPackGroup(groupId, p.config, p.client)
 		p.groups[groupId] = group
 		go func() {
 			group.requestHandler()
@@ -139,14 +140,16 @@ func (p *packer) group(groupId string) *packGroup {
 }
 
 type packGroup struct {
+	groupId   string
 	config    *Config
 	client    *http.Client
 	requests  chan *http.Request
 	responses chan *http.Response
 }
 
-func newPackGroup(config *Config, client *http.Client) *packGroup {
+func newPackGroup(groupId string, config *Config, client *http.Client) *packGroup {
 	return &packGroup{
+		groupId:   groupId,
 		config:    config,
 		client:    client,
 		requests:  make(chan *http.Request),
@@ -155,28 +158,36 @@ func newPackGroup(config *Config, client *http.Client) *packGroup {
 }
 
 func (g *packGroup) requestHandler() {
-	log.Printf("Dispatch: started pack dispatch\n")
+	debugf("group %s - pack n/a    - requestHandler - STARTED\n", g.groupId)
 	var pack *pack
 	var err error
 	var more bool
 	var request *http.Request
 
 	for {
+		debugf("group %s - pack n/a    - requestHandler - Waiting for request\n", g.groupId)
 		select {
 		case request = <-g.requests:
+			debugf("group %s - pack n/a    - requestHandler - request %s - received\n", g.groupId, request.URL.Path)
 			break
 		case <-time.After(time.Duration(g.config.MaxWait) * time.Millisecond):
 			if pack != nil {
-				log.Printf("Dispatch: pack %s timed out\n", pack.id)
+				pack.Lock()
+				debugf("group %s - pack %s - requestHandler - Timeout, sending 'nil'\n", g.groupId, pack.id)
 				pack.requests <- nil
+				pack.Unlock()
+				return
+			} else {
+				debugf("group %s - pack n/a    - requestHandler - TIMEOUT\n", g.groupId)
 				return
 			}
 		}
 
 		if pack == nil {
-			pack, err = newPack(g.config, request)
+			debugf("group %s - pack n/a    - requestHandler - Creating NEW PACK\n", g.groupId)
+			pack, err = newPack(g.groupId, g.config, request)
 			if err != nil {
-				log.Printf("Dispatch: Error creating new pack: %s\n", err.Error())
+				debugf("group %s - pack n/a    - requestHandler - ERROR creating pack: %s\n", g.groupId, err.Error())
 				g.responses <- &http.Response{StatusCode:500}
 				continue // TODO handle errors properly!
 			}
@@ -184,21 +195,27 @@ func (g *packGroup) requestHandler() {
 			go g.handlePack(pack) // TODO handle errors!
 		}
 
+		pack.Lock()
+		debugf("group %s - pack %s - requestHandler - request %s - Sending\n", g.groupId, pack.id, request.URL.Path)
 		pack.requests <- request
+		debugf("group %s - pack %s - requestHandler - request %s - Waiting for more\n", g.groupId, pack.id, request.URL.Path)
 		more = <-pack.more
+		debugf("group %s - pack %s - requestHandler - request %s - More received = %t\n", g.groupId, pack.id, request.URL.Path, more)
 
-		log.Printf("Dispatch: pack %s more receied: %t\n", pack.id, more)
 		if !more {
-			log.Printf("Dispatch: pack %s is full\n", pack.id)
+			debugf("group %s - pack %s - requestHandler - request %s - Pack FULL, sending 'nil'\n", g.groupId, pack.id, request.URL.Path)
 			pack.requests <- nil
+			pack.Unlock()
 			pack = nil
+		} else {
+			pack.Unlock()
 		}
 	}
 }
 
 func (g *packGroup) handlePack(apack *pack) {
 	uri := fmt.Sprintf("http://%s/%s/%s", g.config.ForwardAddr, apack.prefix, apack.id)
-	log.Printf("handlePack: pack %s -> uploading to %s\n", apack.id, uri)
+	debugf("group %s - pack %s - handlePack - Starting upload to %s\n", g.groupId, apack.id, uri)
 
 	request, err := http.NewRequest("PUT", uri, apack)
 	if err != nil {
@@ -211,7 +228,8 @@ func (g *packGroup) handlePack(apack *pack) {
 		panic(err)
 	}
 
-	log.Printf("handlePack: pack %s uploaded, len %d, count %d, status %s\n", apack.id, apack.length, apack.count, response.Status)
+	debugf("group %s - pack %s - handlePack - Upload finished, len %d, count %d, status %s\n", g.groupId,
+		apack.id, apack.length, apack.count, response.Status)
 
 	var body []byte
 	if response.Body != nil {
@@ -235,9 +253,10 @@ func (g *packGroup) handlePack(apack *pack) {
 }
 
 type pack struct {
-	config *Config
-	prefix string
-	id     string
+	groupId string
+	id      string
+	config  *Config
+	prefix  string
 
 	request  *http.Request
 	requests chan *http.Request
@@ -250,16 +269,17 @@ type pack struct {
 	sync.Mutex
 }
 
-func newPack(config *Config, request *http.Request) (*pack, error) {
+func newPack(groupId string, config *Config, request *http.Request) (*pack, error) {
 	prefix, err := parsePrefix(request.URL.Path)
 	if err != nil {
 		return nil, err
 	}
 
 	return &pack{
-		config: config,
-		prefix: prefix,
-		id:     randomHexChars(32),
+		groupId: groupId,
+		id:      randomHexChars(6),
+		config:  config,
+		prefix:  prefix,
 
 		request:  request,
 		requests: make(chan *http.Request),
@@ -272,24 +292,29 @@ func newPack(config *Config, request *http.Request) (*pack, error) {
 }
 
 func (p *pack) Read(out []byte) (int, error) {
-	p.Lock()
-	defer p.Unlock()
+	//p.Lock()
+	//defer p.Unlock()
 
-	log.Printf("pack %s - read(%d)\n", p.id, len(out))
+	debugf("group %s - pack %s - Read       - len = %d\n", p.groupId, p.id, len(out))
 	if p.current == nil {
 		p.current = <-p.requests
 		if p.current == nil {
-			log.Printf("Read: pack %s -> nil request received. Closing pack\n", p.id)
+			debugf("group %s - pack %s - Read       - -> nil request received. Closing pack\n", p.groupId, p.id)
 			return 0, io.EOF
 		}
+
+		p.count++
 	}
 
 	off := 0
 	for off < len(out) {
+		debugf("group %s - pack %s - Read       - Loop len = %d, off = %d\n", p.groupId, p.id, len(out), off)
 		read, err := p.current.Body.Read(out[off:])
 		if err == io.EOF {
+			debugf("group %s - pack %s - Read       - EOF\n", p.groupId, p.id)
 			err = p.current.Body.Close()
 			if err != nil {
+				debugf("group %s - pack %s - Read       - ERROR on close: %s\n", p.groupId, p.id, err.Error())
 				p.more <- false
 				return 0, err
 			}
@@ -297,8 +322,18 @@ func (p *pack) Read(out []byte) (int, error) {
 			off += read
 			p.length += read
 			p.current = nil
+
+			if p.length > p.config.MinSize {
+				//debugf("group %s - pack %s - Read       - Sending more = %t \n", p.groupId, p.id, false)
+				p.more <- false
+			} else {
+				//debugf("group %s - pack %s - Read       - Sending more = %t \n", p.groupId, p.id, true)
+				p.more <- true
+			}
+
 			break
 		} else if err != nil {
+			debugf("group %s - pack %s - Read       - ERROR on read: %s\n", p.groupId, p.id, err.Error())
 			p.more <- false
 			return 0, err
 		}
@@ -307,14 +342,7 @@ func (p *pack) Read(out []byte) (int, error) {
 		p.length += read
 	}
 
-	p.count++
-	log.Printf("pack %s - read %d, total pack len %d, count %d\n", p.id, off, p.length, p.count)
-
-	if p.length > p.config.MinSize {
-		p.more <- false
-	} else {
-		p.more <- true
-	}
+	debugf("group %s - pack %s - Read       - RETURN, off %d, total pack len %d, count %d\n", p.groupId, p.id, off, p.length, p.count)
 
 	return off, nil
 }
