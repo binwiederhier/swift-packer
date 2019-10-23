@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net/http"
 	"reflect"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,6 +30,7 @@ type Config struct {
 type packer struct {
 	config *Config
 	client *http.Client
+	counter int32
 	groups map[string]*packGroup
 	sync.Mutex
 }
@@ -36,6 +39,7 @@ func NewPacker(config *Config) Packer {
 	return &packer{
 		config: config,
 		client: &http.Client{},
+		counter: 0,
 		groups: make(map[string]*packGroup, 0),
 	}
 }
@@ -48,10 +52,20 @@ func (p *packer) ListenAndServe() error {
 		Handler: p,
 	}
 
+	go func() {
+		for {
+			log.Printf("Clients %d\n", atomic.LoadInt32(&p.counter))
+			time.Sleep(1 * time.Second)
+		}
+	}()
+
 	return server.ListenAndServe()
 }
 
 func (p *packer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt32(&p.counter, 1)
+	defer atomic.AddInt32(&p.counter, -1)
+
 	if r.Method == "PUT" && r.Header.Get("X-Pack") == "yes" {
 		p.handlePut(w, r)
 	} else {
@@ -121,8 +135,12 @@ func (p *packer) fail(w http.ResponseWriter, status int, err error) {
 }
 
 func (p *packer) group(groupId string) *packGroup {
+	debugf("group %s - group - lock\n", groupId)
 	p.Lock()
-	defer p.Unlock()
+	defer func() {
+		p.Unlock()
+		debugf("group %s - group - unlock\n", groupId)
+	}()
 
 	group, ok := p.groups[groupId]
 	if !ok {
@@ -162,12 +180,13 @@ func (g *packGroup) groupWorker() {
 	debugf("group %s - pack n/a    - groupWorker - STARTED\n", g.groupId)
 
 	workers := make([]chan *http.Request, 0)
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 1; i++ {
 		workers = append(workers, make(chan *http.Request))
 		go g.packWorker(workers[i])
 	}
 
 	for {
+		debugf("group %s - pack n/a    - groupWorker - Reading from request channel\n", g.groupId)
 		select {
 		case request := <-g.requests:
 			debugf("group %s - pack n/a    - groupWorker - Read request %s\n", g.groupId, request.URL.Path)
@@ -344,10 +363,10 @@ func (p *pack) Read(out []byte) (int, error) {
 			p.current = nil
 
 			if p.length > p.config.MinSize {
-				//debugf("group %s - pack %s - Read       - Sending more = %t \n", p.groupId, p.id, false)
+				debugf("group %s - pack %s - Read       - Sending more = %t \n", p.groupId, p.id, false)
 				p.more <- false
 			} else {
-				//debugf("group %s - pack %s - Read       - Sending more = %t \n", p.groupId, p.id, true)
+				debugf("group %s - pack %s - Read       - Sending more = %t \n", p.groupId, p.id, true)
 				p.more <- true
 			}
 
