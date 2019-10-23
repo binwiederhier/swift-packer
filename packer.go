@@ -42,6 +42,7 @@ type pack struct {
 	groupId string
 	packId string
 
+	first     *http.Request
 	parts     map[string]*xpart
 	size      int
 
@@ -145,29 +146,10 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	p.Lock()
 	apack, ok := p.packs[groupId]
 	if !ok {
-		apack = &pack{
-			groupId:   groupId,
-			packId:    randomHexChars(32),
-			parts:     make(map[string]*xpart, 0),
-			size:      0,
-			timer:     time.NewTimer(p.config.MaxWait),
-			responses: make(chan *http.Response),
-			done:      make(chan bool),
-		}
+		apack = p.newPack(groupId, request)
 		p.packs[groupId] = apack
-		go func() {
-			select {
-			case <-apack.timer.C:
-				p.Lock()
-				go p.packUpload(apack, request)
-				delete(p.packs, groupId)
-				p.Unlock()
-				break
-			case <-apack.done:
-				break
-			}
-		}()
 	}
+
 	apack.parts[request.URL.Path] = &xpart{
 		data: bytes.NewReader(buffer[:off]),
 	}
@@ -176,7 +158,7 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	apack.timer.Reset(p.config.MaxWait)
 
 	if apack.size > p.config.MinSize {
-		go p.packUpload(apack, request)
+		go p.packUpload(apack)
 		delete(p.packs, groupId)
 		apack.done <- true
 	}
@@ -192,8 +174,38 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	}
 }
 
-func (p *packer) packUpload(apack *pack, r *http.Request) {
-	prefix, err := parsePrefix(r.URL.Path)
+func (p *packer) newPack(groupId string, first *http.Request) *pack {
+	apack := &pack{
+		groupId:   groupId,
+		packId:    randomHexChars(32),
+
+		first:     first,
+		parts:     make(map[string]*xpart, 0),
+		size:      0,
+
+		timer:     time.NewTimer(p.config.MaxWait),
+		responses: make(chan *http.Response),
+		done:      make(chan bool),
+	}
+
+	go func() {
+		select {
+		case <-apack.timer.C:
+			p.Lock()
+			go p.packUpload(apack)
+			delete(p.packs, groupId)
+			p.Unlock()
+			break
+		case <-apack.done:
+			break
+		}
+	}()
+
+	return apack
+}
+
+func (p *packer) packUpload(apack *pack) {
+	prefix, err := parsePrefix(apack.first.URL.Path)
 	if err != nil {
 		panic(err)
 	}
@@ -211,7 +223,7 @@ func (p *packer) packUpload(apack *pack, r *http.Request) {
 		panic(err)
 	}
 
-	copyRequestHeader(upstreamRequest, r)
+	copyRequestHeader(upstreamRequest, apack.first)
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		panic(err)
