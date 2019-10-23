@@ -33,7 +33,18 @@ type packer struct {
 	counter int32
 	groups map[string]*packGroup
 	buffers *sync.Pool
+	packs map[string]*xpack
 	sync.Mutex
+}
+
+type xpart struct {
+	data io.Reader
+}
+type xpack struct {
+	parts map[string]*xpart
+	size int
+	last time.Time
+	done chan *http.Response
 }
 
 func NewPacker(config *Config) Packer {
@@ -48,6 +59,7 @@ func NewPacker(config *Config) Packer {
 				return b
 			},
 		},
+		packs: make(map[string]*xpack),
 	}
 }
 
@@ -84,17 +96,6 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	var groupId string
 	var err error
 
-	// Determine pack group
-	if request.Header.Get("X-Pack-Group") != "" {
-		groupId = request.Header.Get("X-Pack-Group")
-	} else {
-		groupId, err = parsePrefix(request.URL.Path)
-		if err != nil {
-			p.fail(w, 400, err)
-			return
-		}
-	}
-
 	// Determine if request is too big
 	buffer := p.buffers.Get().([]byte)
 	defer p.buffers.Put(buffer)
@@ -124,16 +125,91 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 		off += read
 	}
 
+	// Determine pack group
+	if request.Header.Get("X-Pack-Group") != "" {
+		groupId = request.Header.Get("X-Pack-Group")
+	} else {
+		groupId, err = parsePrefix(request.URL.Path)
+		if err != nil {
+			p.fail(w, 400, err)
+			return
+		}
+	}
+
 	debugf("group %s - pack n/a    - handlePut - read %d bytes into buffer, packing\n", groupId, len(buffer))
 	request.Body = ioutil.NopCloser(bytes.NewReader(buffer[:off]))
 
-	// Fetch group and queue request
-	group := p.group(groupId)
-	debugf("group %s - pack n/a    - handlePut - request %s - received\n", groupId, request.URL.Path)
+	p.Lock()
+	pack, ok := p.packs[groupId]
+	if !ok {
+		pack = &xpack{
+			parts: make(map[string]*xpart, 0),
+			size: 0,
+			last: time.Now(),
+			done: make(chan *http.Response),
+		}
+		p.packs[groupId] = pack
+	}
+	pack.parts[request.URL.Path] = &xpart{
+		data: bytes.NewReader(buffer[:off]),
+	}
+	pack.size += len(buffer[:off])
+	if pack.size > p.config.MinSize {
+		go func(path string, r *http.Request, done chan *http.Response) {
+			prefix, err := parsePrefix(request.URL.Path)
+			if err != nil {
+				panic(err)
+			}
 
-	group.requests <- request
-	debugf("group %s - pack n/a    - handlePut - request %s - dispatched\n", groupId, request.URL.Path)
-	response := <-group.responses
+			id := randomHexChars(5)
+			uri := fmt.Sprintf("http://%s/%s/%s", p.config.ForwardAddr, prefix, id)
+			debugf("group %s - pack %s - handlePack - Starting upload to %s\n", groupId, id, uri)
+
+			readers := make([]io.Reader, 0)
+			for _, part := range pack.parts {
+				readers = append(readers, part.data)
+			}
+
+			upstreamRequest, err := http.NewRequest("PUT", uri, io.MultiReader(readers...))
+			if err != nil {
+				panic(err)
+			}
+
+			copyRequestHeader(upstreamRequest, r)
+			response, err := p.client.Do(upstreamRequest)
+			if err != nil {
+				panic(err)
+			}
+
+			debugf("group %s - pack %s - handlePack - Upload finished, len %d, count %d, status %s\n", groupId,
+				id, pack.size, len(pack.parts), response.Status)
+
+			var body []byte
+			if response.Body != nil {
+				body, err = ioutil.ReadAll(response.Body)
+				if err != nil {
+					panic(err)
+				}
+				if err := response.Body.Close(); err != nil {
+					panic(err)
+				}
+			}
+
+			response.Header.Add("X-Pack-Id", uri)
+			for i := 0; i < len(pack.parts); i++ {
+				downResponse := response
+				if body != nil {
+					downResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
+				}
+				done <- downResponse
+			}
+		}(request.URL.Path, request, pack.done)
+
+		delete(p.packs, groupId)
+	}
+	p.Unlock()
+
+	response := <-pack.done
 	debugf("group %s - pack n/a    - handlePut - request %s - response received: %s\n",
 		groupId, request.URL.Path, response.Status)
 
