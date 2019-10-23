@@ -162,7 +162,7 @@ func (g *packGroup) groupWorker() {
 	debugf("group %s - pack n/a    - groupWorker - STARTED\n", g.groupId)
 
 	workers := make([]chan *http.Request, 0)
-	for i := 0; i < 1; i++ {
+	for i := 0; i < 5; i++ {
 		workers = append(workers, make(chan *http.Request))
 		go g.packWorker(workers[i])
 	}
@@ -198,6 +198,9 @@ func (g *packGroup) packWorker(requests chan *http.Request) {
 	for request := range requests {
 		if request == nil {
 			debugf("group %s - pack n/a    - packWork - NIL received. Closing packWorker\n", g.groupId)
+			if apack != nil {
+				apack.requests <- request
+			}
 			close(requests)
 			return
 		}
