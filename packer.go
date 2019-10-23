@@ -31,14 +31,14 @@ type packer struct {
 	client  *http.Client
 	clients int32
 	buffers *sync.Pool
-	packs   map[string]*xpack
+	packs   map[string]*pack
 	sync.Mutex
 }
 
 type xpart struct {
 	data io.Reader
 }
-type xpack struct {
+type pack struct {
 	groupId string
 	packId string
 
@@ -59,7 +59,7 @@ func NewPacker(config *Config) Packer {
 				return b
 			},
 		},
-		packs: make(map[string]*xpack),
+		packs: make(map[string]*pack),
 	}
 }
 
@@ -140,9 +140,9 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	request.Body = ioutil.NopCloser(bytes.NewReader(buffer[:off]))
 
 	p.Lock()
-	pack, ok := p.packs[groupId]
+	apack, ok := p.packs[groupId]
 	if !ok {
-		pack = &xpack{
+		apack = &pack{
 			groupId: groupId,
 			packId: randomHexChars(32),
 			parts: make(map[string]*xpart, 0),
@@ -150,19 +150,19 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 			last: time.Now(),
 			done: make(chan *http.Response),
 		}
-		p.packs[groupId] = pack
+		p.packs[groupId] = apack
 	}
-	pack.parts[request.URL.Path] = &xpart{
+	apack.parts[request.URL.Path] = &xpart{
 		data: bytes.NewReader(buffer[:off]),
 	}
-	pack.size += len(buffer[:off])
-	if pack.size > p.config.MinSize {
-		go p.packUpload(pack, request)
+	apack.size += len(buffer[:off])
+	if apack.size > p.config.MinSize {
+		go p.packUpload(apack, request)
 		delete(p.packs, groupId)
 	}
 	p.Unlock()
 
-	response := <-pack.done
+	response := <-apack.done
 	debugf("group %s - pack n/a    - handlePut - request %s - response received: %s\n",
 		groupId, request.URL.Path, response.Status)
 
@@ -172,17 +172,17 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	}
 }
 
-func (p *packer) packUpload(pack *xpack, r *http.Request) {
+func (p *packer) packUpload(apack *pack, r *http.Request) {
 	prefix, err := parsePrefix(r.URL.Path)
 	if err != nil {
 		panic(err)
 	}
 
-	uri := fmt.Sprintf("http://%s/%s/%s", p.config.ForwardAddr, prefix, pack.packId)
-	debugf("group %s - pack %s - handlePack - Starting upload to %s\n", pack.groupId, pack.packId, uri)
+	uri := fmt.Sprintf("http://%s/%s/%s", p.config.ForwardAddr, prefix, apack.packId)
+	debugf("Uploading pack %s (group %s) to %s\n", apack.packId, apack.groupId, uri)
 
 	readers := make([]io.Reader, 0)
-	for _, part := range pack.parts {
+	for _, part := range apack.parts {
 		readers = append(readers, part.data)
 	}
 
@@ -197,8 +197,8 @@ func (p *packer) packUpload(pack *xpack, r *http.Request) {
 		panic(err)
 	}
 
-	debugf("group %s - pack %s - handlePack - Upload finished, len %d, count %d, status %s\n", pack.groupId,
-		pack.packId, pack.size, len(pack.parts), response.Status)
+	debugf("group %s - pack %s - handlePack - Upload finished, len %d, count %d, status %s\n", apack.groupId,
+		apack.packId, apack.size, len(apack.parts), response.Status)
 
 	var body []byte
 	if response.Body != nil {
@@ -212,12 +212,12 @@ func (p *packer) packUpload(pack *xpack, r *http.Request) {
 	}
 
 	response.Header.Add("X-Pack-Id", uri)
-	for i := 0; i < len(pack.parts); i++ {
+	for i := 0; i < len(apack.parts); i++ {
 		downResponse := response
 		if body != nil {
 			downResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
 		}
-		pack.done <- downResponse
+		apack.done <- downResponse
 	}
 }
 
