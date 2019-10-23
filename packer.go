@@ -23,7 +23,7 @@ type Config struct {
 	ListenAddr  string
 	ForwardAddr string
 	MinSize     int
-	MaxWait     int
+	MaxWait     time.Duration
 }
 
 type packer struct {
@@ -42,10 +42,12 @@ type pack struct {
 	groupId string
 	packId string
 
-	parts map[string]*xpart
-	size int
-	last time.Time
-	done chan *http.Response
+	parts     map[string]*xpart
+	size      int
+
+	timer     *time.Timer
+	responses chan *http.Response
+	done      chan bool
 }
 
 func NewPacker(config *Config) Packer {
@@ -120,7 +122,11 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	request.Body.Close()
+	if err := request.Body.Close(); err != nil {
+		panic(err)
+	}
+
+	debugf("Incoming request %s fully read (%d bytes), appending to pack\n", request.URL.Path, off)
 
 	// Determine pack group
 	var groupId string
@@ -136,33 +142,47 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 		}
 	}
 
-	debugf("handlePut - group %s - request fully read (%d bytes), appending to pack\n", groupId, off)
-	request.Body = ioutil.NopCloser(bytes.NewReader(buffer[:off]))
-
 	p.Lock()
 	apack, ok := p.packs[groupId]
 	if !ok {
 		apack = &pack{
-			groupId: groupId,
-			packId: randomHexChars(32),
-			parts: make(map[string]*xpart, 0),
-			size: 0,
-			last: time.Now(),
-			done: make(chan *http.Response),
+			groupId:   groupId,
+			packId:    randomHexChars(32),
+			parts:     make(map[string]*xpart, 0),
+			size:      0,
+			timer:     time.NewTimer(p.config.MaxWait),
+			responses: make(chan *http.Response),
+			done:      make(chan bool),
 		}
 		p.packs[groupId] = apack
+		go func() {
+			select {
+			case <-apack.timer.C:
+				p.Lock()
+				go p.packUpload(apack, request)
+				delete(p.packs, groupId)
+				p.Unlock()
+				break
+			case <-apack.done:
+				break
+			}
+		}()
 	}
 	apack.parts[request.URL.Path] = &xpart{
 		data: bytes.NewReader(buffer[:off]),
 	}
+
 	apack.size += len(buffer[:off])
+	apack.timer.Reset(p.config.MaxWait)
+
 	if apack.size > p.config.MinSize {
 		go p.packUpload(apack, request)
 		delete(p.packs, groupId)
+		apack.done <- true
 	}
 	p.Unlock()
 
-	response := <-apack.done
+	response := <-apack.responses
 	debugf("group %s - pack n/a    - handlePut - request %s - response received: %s\n",
 		groupId, request.URL.Path, response.Status)
 
@@ -217,7 +237,7 @@ func (p *packer) packUpload(apack *pack, r *http.Request) {
 		if body != nil {
 			downResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
 		}
-		apack.done <- downResponse
+		apack.responses <- downResponse
 	}
 }
 

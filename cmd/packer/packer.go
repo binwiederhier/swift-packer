@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -38,7 +39,7 @@ func main() {
 		ListenAddr:  *listenAddrFlag,
 		ForwardAddr: forwardAddr,
 		MinSize:     minSize,
-		MaxWait:     *maxWaitFlag,
+		MaxWait:     time.Duration(*maxWaitFlag) * time.Millisecond,
 	})
 
 	log.Fatalln(packer.ListenAndServe())
