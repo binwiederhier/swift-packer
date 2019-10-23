@@ -32,6 +32,7 @@ type packer struct {
 	client *http.Client
 	counter int32
 	groups map[string]*packGroup
+	buffers *sync.Pool
 	sync.Mutex
 }
 
@@ -41,6 +42,12 @@ func NewPacker(config *Config) Packer {
 		client: &http.Client{},
 		counter: 0,
 		groups: make(map[string]*packGroup, 0),
+		buffers: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, config.MinSize)
+				return b
+			},
+		},
 	}
 }
 
@@ -87,6 +94,38 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 	}
+
+	// Determine if request is too big
+	buffer := p.buffers.Get().([]byte)
+	defer p.buffers.Put(buffer)
+	off := 0
+	for off < len(buffer) {
+		debugf("group %s - pack n/a    - handlePut - %s - read %d\n", groupId, request.URL.Path, off)
+		read, err := request.Body.Read(buffer[off:])
+		debugf("group %s - pack n/a    - handlePut - %s - read = %d\n", groupId, request.URL.Path, read)
+		if err == io.EOF {
+			off += read
+
+			if off == len(buffer) {
+				debugf("group %s - pack n/a    - handlePut - read %d bytes into buffer, forwarding\n", groupId, len(buffer))
+				request.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer[:off]), request.Body))
+				p.forwardRequest(w, request)
+				return
+			} else {
+				break
+			}
+		} else if err != nil {
+			debugf("group %s - pack n/a    - handlePut - ERROR reading body: %s\n", groupId, err.Error())
+			request.Body.Close()
+			w.WriteHeader(500)
+			return
+		}
+
+		off += read
+	}
+
+	debugf("group %s - pack n/a    - handlePut - read %d bytes into buffer, packing\n", groupId, len(buffer))
+	request.Body = ioutil.NopCloser(bytes.NewReader(buffer[:off]))
 
 	// Fetch group and queue request
 	group := p.group(groupId)
