@@ -255,8 +255,9 @@ func (p *packer) packUpload(apack *pack) {
 			Header: copyHeader(upstreamResponse.Header),
 		}
 
-		response.Header.Add("X-Pack-Id", uri)
-		response.Header.Add("X-Pack-Offset", fmt.Sprintf("%d", apart.offset))
+		response.Header.Add("X-Pack-Id", apack.packId)
+		response.Header.Add("X-Item-Offset", fmt.Sprintf("%d", apart.offset))
+		response.Header.Add("X-Item-Length", fmt.Sprintf("%d", len(apart.data)))
 
 		if body != nil {
 			response.Body = ioutil.NopCloser(bytes.NewReader(body))
