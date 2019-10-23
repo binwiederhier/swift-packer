@@ -101,20 +101,12 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	defer p.buffers.Put(buffer)
 	off := 0
 	for off < len(buffer) {
-		debugf("group %s - pack n/a    - handlePut - %s - read %d\n", groupId, request.URL.Path, off)
 		read, err := request.Body.Read(buffer[off:])
 		debugf("group %s - pack n/a    - handlePut - %s - read = %d\n", groupId, request.URL.Path, read)
 		if err == io.EOF {
 			off += read
-
-			if off == len(buffer) {
-				debugf("group %s - pack n/a    - handlePut - read %d bytes into buffer, forwarding\n", groupId, len(buffer))
-				request.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer[:off]), request.Body))
-				p.forwardRequest(w, request)
-				return
-			} else {
-				break
-			}
+			debugf("group %s - pack n/a    - handlePut - %s - EOF, off = %d\n", groupId, request.URL.Path, off)
+			break
 		} else if err != nil {
 			debugf("group %s - pack n/a    - handlePut - ERROR reading body: %s\n", groupId, err.Error())
 			request.Body.Close()
@@ -124,6 +116,15 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 
 		off += read
 	}
+
+	if off == len(buffer) {
+		debugf("group %s - pack n/a    - handlePut - read %d bytes into buffer, forwarding\n", groupId, len(buffer))
+		request.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer[:off]), request.Body))
+		p.forwardRequest(w, request)
+		return
+	}
+
+	request.Body.Close()
 
 	// Determine pack group
 	if request.Header.Get("X-Pack-Group") != "" {
