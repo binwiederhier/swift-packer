@@ -11,7 +11,7 @@ import (
 func main() {
 	listenAddr := flag.String("listen", ":1234", "Listen address for packer service")
 	minSize := flag.Int("minsize", 128 * 1024, "Minimum pack size in bytes")
-	maxWait := flag.Int("maxwait", 200, "Wait time in milliseconds for downstream PUTs before closing pack")
+	maxWait := flag.Int("maxwait", 100, "Wait time in milliseconds for downstream PUTs before closing pack")
 	debug := flag.Bool("debug", false, "Enable debug mode")
 	quiet := flag.Bool("quiet", false, "Do not output anything")
 	flag.Parse()

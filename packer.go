@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net/http"
+	"reflect"
 	"regexp"
 	"sync"
 	"time"
@@ -129,7 +130,7 @@ func (p *packer) group(groupId string) *packGroup {
 		group = newPackGroup(groupId, p.config, p.client)
 		p.groups[groupId] = group
 		go func() {
-			group.requestHandler()
+			group.groupWorker()
 			p.Lock()
 			delete(p.groups, groupId)
 			p.Unlock()
@@ -157,60 +158,76 @@ func newPackGroup(groupId string, config *Config, client *http.Client) *packGrou
 	}
 }
 
-func (g *packGroup) requestHandler() {
-	debugf("group %s - pack n/a    - requestHandler - STARTED\n", g.groupId)
-	var pack *pack
-	var err error
-	var more bool
-	var request *http.Request
+func (g *packGroup) groupWorker() {
+	debugf("group %s - pack n/a    - groupWorker - STARTED\n", g.groupId)
+
+	workers := make([]chan *http.Request, 0)
+	for i := 0; i < 1; i++ {
+		workers = append(workers, make(chan *http.Request))
+		go g.packWorker(workers[i])
+	}
 
 	for {
-		debugf("group %s - pack n/a    - requestHandler - Waiting for request\n", g.groupId)
 		select {
-		case request = <-g.requests:
-			debugf("group %s - pack n/a    - requestHandler - request %s - received\n", g.groupId, request.URL.Path)
+		case request := <-g.requests:
+			debugf("group %s - pack n/a    - groupWorker - Read request %s\n", g.groupId, request.URL.Path)
+			workers[rand.Intn(len(workers))] <- request
 			break
 		case <-time.After(time.Duration(g.config.MaxWait) * time.Millisecond):
-			if pack != nil {
-				pack.Lock()
-				debugf("group %s - pack %s - requestHandler - Timeout, sending 'nil'\n", g.groupId, pack.id)
-				pack.requests <- nil
-				pack.Unlock()
-				return
-			} else {
-				debugf("group %s - pack n/a    - requestHandler - TIMEOUT\n", g.groupId)
-				return
+			debugf("group %s - pack n/a    - groupWorker - Timeout. Sending NIL to workers\n", g.groupId)
+			for _, worker := range workers {
+				worker <- nil
 			}
+			debugf("group %s - pack n/a    - groupWorker - EXITED\n", g.groupId)
+			return
+		}
+	}
+}
+
+// AWFUL
+func randMapKey(m interface{}) interface{} {
+	mapKeys := reflect.ValueOf(m).MapKeys()
+	return mapKeys[rand.Intn(len(mapKeys))].Interface()
+}
+
+func (g *packGroup) packWorker(requests chan *http.Request) {
+	var err error
+	var more bool
+	var apack *pack
+
+	for request := range requests {
+		if request == nil {
+			debugf("group %s - pack n/a    - packWork - NIL received. Closing packWorker\n", g.groupId)
+			close(requests)
+			return
 		}
 
-		if pack == nil {
-			debugf("group %s - pack n/a    - requestHandler - Creating NEW PACK\n", g.groupId)
-			pack, err = newPack(g.groupId, g.config, request)
+		if apack == nil {
+			debugf("group %s - pack n/a    - packWork - Creating NEW PACK\n", g.groupId)
+			apack, err = newPack(g.groupId, g.config, request)
 			if err != nil {
-				debugf("group %s - pack n/a    - requestHandler - ERROR creating pack: %s\n", g.groupId, err.Error())
-				g.responses <- &http.Response{StatusCode:500}
+				debugf("group %s - pack n/a    - packWork - ERROR creating pack: %s\n", g.groupId, err.Error())
+				g.responses <- &http.Response{StatusCode: 500}
 				continue // TODO handle errors properly!
 			}
 
-			go g.handlePack(pack) // TODO handle errors!
+			go g.handlePack(apack) // TODO handle errors!
 		}
 
-		pack.Lock()
-		debugf("group %s - pack %s - requestHandler - request %s - Sending\n", g.groupId, pack.id, request.URL.Path)
-		pack.requests <- request
-		debugf("group %s - pack %s - requestHandler - request %s - Waiting for more\n", g.groupId, pack.id, request.URL.Path)
-		more = <-pack.more
-		debugf("group %s - pack %s - requestHandler - request %s - More received = %t\n", g.groupId, pack.id, request.URL.Path, more)
+		debugf("group %s - pack %s - packWork - request %s - Sending\n", g.groupId, apack.id, request.URL.Path)
+		apack.requests <- request
+		debugf("group %s - pack %s - packWork - request %s - Waiting for more\n", g.groupId, apack.id, request.URL.Path)
+		more = <-apack.more
+		debugf("group %s - pack %s - packWork - request %s - More received = %t\n", g.groupId, apack.id, request.URL.Path, more)
 
 		if !more {
-			debugf("group %s - pack %s - requestHandler - request %s - Pack FULL, sending 'nil'\n", g.groupId, pack.id, request.URL.Path)
-			pack.requests <- nil
-			pack.Unlock()
-			pack = nil
-		} else {
-			pack.Unlock()
+			debugf("group %s - pack %s - packWork - request %s - Pack FULL, sending 'nil'\n", g.groupId, apack.id, request.URL.Path)
+			apack.requests <- nil
+			apack = nil
 		}
 	}
+
+	debugf("group %s - pack n/a    - packWork - Exiting\n", g.groupId)
 }
 
 func (g *packGroup) handlePack(apack *pack) {
