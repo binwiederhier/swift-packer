@@ -35,19 +35,21 @@ type packer struct {
 	sync.Mutex
 }
 
-type xpart struct {
-	data io.Reader
+type part struct {
+	response chan *http.Response
+	offset   int
+	data     []byte
 }
+
 type pack struct {
 	groupId string
 	packId string
 
-	first     *http.Request
-	parts     map[string]*xpart
-	size      int
+	firstRequest *http.Request
+	parts        []*part
+	size         int
 
 	timer     *time.Timer
-	responses chan *http.Response
 	done      chan bool
 }
 
@@ -117,7 +119,7 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 
 	// Request is at least as large as buffer, forward upstream
 	if off == len(buffer) {
-		debugf("handlePut - buffer full (%d bytes), forwarding\n", len(buffer))
+		debugf("Incoming request %s too large for packing (%d bytes), forwarding upstream\n", request.URL.Path, off)
 		request.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer[:off]), request.Body)) // FIXME leaking body
 		p.forwardRequest(w, request)
 		return
@@ -150,11 +152,15 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 		p.packs[groupId] = apack
 	}
 
-	apack.parts[request.URL.Path] = &xpart{
-		data: bytes.NewReader(buffer[:off]),
-	}
+	responseChan := make(chan *http.Response)
+	defer close(responseChan)
 
-	apack.size += len(buffer[:off])
+	apack.parts = append(apack.parts, &part{
+		offset: apack.size,
+		data: buffer[:off],
+		response: responseChan,
+	})
+	apack.size += len(buffer[:off]) // Do not reorder, see above!
 	apack.timer.Reset(p.config.MaxWait)
 
 	if apack.size > p.config.MinSize {
@@ -164,9 +170,9 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	}
 	p.Unlock()
 
-	response := <-apack.responses
-	debugf("group %s - pack n/a    - handlePut - request %s - response received: %s\n",
-		groupId, request.URL.Path, response.Status)
+	response := <-responseChan
+	debugf("Dispatching response for pack: %s (group %s), request: %s, response: %s\n",
+		apack.packId, apack.groupId, request.URL.Path, response.Status)
 
 	copyAndWriteResponseHeader(w, response)
 	if err := writeResponse(w, response); err != nil {
@@ -179,12 +185,11 @@ func (p *packer) newPack(groupId string, first *http.Request) *pack {
 		groupId:   groupId,
 		packId:    randomHexChars(32),
 
-		first:     first,
-		parts:     make(map[string]*xpart, 0),
-		size:      0,
+		firstRequest: first,
+		parts:        make([]*part, 0),
+		size:         0,
 
 		timer:     time.NewTimer(p.config.MaxWait),
-		responses: make(chan *http.Response),
 		done:      make(chan bool),
 	}
 
@@ -205,7 +210,7 @@ func (p *packer) newPack(groupId string, first *http.Request) *pack {
 }
 
 func (p *packer) packUpload(apack *pack) {
-	prefix, err := parsePrefix(apack.first.URL.Path)
+	prefix, err := parsePrefix(apack.firstRequest.URL.Path)
 	if err != nil {
 		panic(err)
 	}
@@ -214,8 +219,8 @@ func (p *packer) packUpload(apack *pack) {
 	debugf("Uploading pack %s (group %s) to %s\n", apack.packId, apack.groupId, uri)
 
 	readers := make([]io.Reader, 0)
-	for _, part := range apack.parts {
-		readers = append(readers, part.data)
+	for _, apart := range apack.parts {
+		readers = append(readers, bytes.NewReader(apart.data))
 	}
 
 	upstreamRequest, err := http.NewRequest("PUT", uri, io.MultiReader(readers...))
@@ -223,33 +228,41 @@ func (p *packer) packUpload(apack *pack) {
 		panic(err)
 	}
 
-	copyRequestHeader(upstreamRequest, apack.first)
-	response, err := p.client.Do(upstreamRequest)
+	copyRequestHeader(upstreamRequest, apack.firstRequest)
+	upstreamResponse, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		panic(err)
 	}
 
-	debugf("group %s - pack %s - handlePack - Upload finished, len %d, count %d, status %s\n", apack.groupId,
-		apack.packId, apack.size, len(apack.parts), response.Status)
+	debugf("Uploading pack %s (group %s) finished, len %d, count %d, status %s\n",
+		apack.packId, apack.groupId, apack.size, len(apack.parts), upstreamResponse.Status)
 
 	var body []byte
-	if response.Body != nil {
-		body, err = ioutil.ReadAll(response.Body)
+	if upstreamResponse.Body != nil {
+		body, err = ioutil.ReadAll(upstreamResponse.Body)
 		if err != nil {
 			panic(err)
 		}
-		if err := response.Body.Close(); err != nil {
+		if err := upstreamResponse.Body.Close(); err != nil {
 			panic(err)
 		}
 	}
 
-	response.Header.Add("X-Pack-Id", uri)
-	for i := 0; i < len(apack.parts); i++ {
-		downResponse := response
-		if body != nil {
-			downResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
+	for _, apart := range apack.parts {
+		response := &http.Response{
+			Status: upstreamResponse.Status,
+			StatusCode: upstreamResponse.StatusCode,
+			Header: copyHeader(upstreamResponse.Header),
 		}
-		apack.responses <- downResponse
+
+		response.Header.Add("X-Pack-Id", uri)
+		response.Header.Add("X-Pack-Offset", fmt.Sprintf("%d", apart.offset))
+
+		if body != nil {
+			response.Body = ioutil.NopCloser(bytes.NewReader(body))
+		}
+
+		apart.response <- response
 	}
 }
 
@@ -320,6 +333,18 @@ func copyAndWriteResponseHeader(w http.ResponseWriter, from *http.Response) {
 
 	w.WriteHeader(from.StatusCode)
 }
+
+
+func copyHeader(from http.Header) http.Header {
+	to := http.Header{}
+	for header, values := range from {
+		for _, value := range values {
+			to.Add(header, value)
+		}
+	}
+	return to
+}
+
 
 func writeResponse(w http.ResponseWriter, response *http.Response) error {
 	if _, err := io.Copy(w, response.Body); err != nil {
