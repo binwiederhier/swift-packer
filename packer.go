@@ -132,19 +132,12 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	debugf("Incoming request %s fully read (%d bytes), appending to pack\n", request.URL.Path, off)
 
 	// Determine pack group
-	var groupId string
-	var err error
-
-	if request.Header.Get("X-Pack-Group") != "" {
-		groupId = request.Header.Get("X-Pack-Group")
-	} else {
-		groupId, err = parsePrefix(request.URL.Path)
-		if err != nil {
-			p.fail(w, 400, err)
-			return
-		}
+	groupId, err := p.parseGroupId(request)
+	if err != nil {
+		p.fail(w, 400, err)
+		return
 	}
-
+	
 	p.Lock()
 	apack, ok := p.packs[groupId]
 	if !ok {
@@ -295,6 +288,19 @@ func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
 func (p *packer) fail(w http.ResponseWriter, status int, err error) {
 	w.WriteHeader(status)
 	w.Write([]byte(err.Error()))
+}
+
+func (p *packer) parseGroupId(request *http.Request) (string, error) {
+	if request.Header.Get("X-Pack-Group") != "" {
+		return request.Header.Get("X-Pack-Group"), nil
+	} else {
+		groupId, err := parsePrefix(request.URL.Path)
+		if err != nil {
+			return "", err
+		}
+
+		return groupId, nil
+	}
 }
 
 var hexCharset = []rune("0123456789abcdef")
