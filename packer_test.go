@@ -6,10 +6,14 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestPacker(t *testing.T) {
+	var counter int32
+
 	// Start fake Swift server
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		body, err := ioutil.ReadAll(r.Body)
@@ -20,6 +24,7 @@ func TestPacker(t *testing.T) {
 
 		t.Logf("Fake Swift received request %s with payload %s\n", r.URL.Path, string(body))
 		w.WriteHeader(201)
+		atomic.AddInt32(&counter, 1)
 	})
 
 	go http.ListenAndServe("127.0.0.1:22586", nil)
@@ -28,8 +33,8 @@ func TestPacker(t *testing.T) {
 	packer := NewPacker(&Config{
 		ListenAddr:  "127.0.0.1:12586",
 		ForwardAddr: "127.0.0.1:22586",
-		MinSize:     5,
-		MaxWait:     200,
+		MinSize:     50,
+		MaxWait:     200 * time.Millisecond,
 	})
 
 	go packer.ListenAndServe()
@@ -38,15 +43,15 @@ func TestPacker(t *testing.T) {
 	var wg sync.WaitGroup
 	client := &http.Client{}
 
-	wg.Add(100)
+	wg.Add(101)
 	go func() {
-		for i := 0; i < 100; i++ {
+		for i := 0; i < 101; i++ {
 			// time.Sleep(20 * time.Millisecond)
 
 			go func(v int) {
-				payload := fmt.Sprintf("PUT%d", v)
-				request, err := http.NewRequest("PUT", "http://127.0.0.1:12586/v1/AUTH_admin/mycontainer/myobject",
-					strings.NewReader(payload))
+				payload := fmt.Sprintf("BLA%03d", v)
+				uri := fmt.Sprintf("http://127.0.0.1:12586/v1/AUTH_admin/mycontainer/myobject%d", v)
+				request, err := http.NewRequest("PUT", uri,	strings.NewReader(payload))
 				if err != nil {
 					t.Error(err)
 					t.FailNow()
@@ -67,6 +72,14 @@ func TestPacker(t *testing.T) {
 					t.FailNow()
 				}
 
+				if response.Header.Get("X-Pack-Id") == "" ||
+					response.Header.Get("X-Item-Offset") == "" ||
+					response.Header.Get("X-Item-Length") == "" {
+
+					t.Errorf("Expected headers not in response")
+					t.FailNow()
+				}
+
 				wg.Done()
 			}(i)
 		}
@@ -75,4 +88,11 @@ func TestPacker(t *testing.T) {
 	// t.Fail()
 
 	wg.Wait()
+
+	// Each payload is 6 bytes, min pack size is 50 -> ceil(50/6) = 9 PUTs per pack
+	// For 101 PUTs, that's ceil(101/9) = 12 packs
+	if counter != 12 {
+		t.Errorf("Fake swift backend received %d PUTs, expected %d", counter, 12)
+		t.FailNow()
+	}
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
-	"log"
 	"math/rand"
 	"net/http"
 	"regexp"
@@ -40,6 +39,7 @@ var (
 )
 
 func NewPacker(config *Config) Packer {
+	//Debug = true
 	return &packer{
 		config:  config,
 		client:  &http.Client{},
@@ -64,7 +64,7 @@ func (p *packer) ListenAndServe() error {
 
 	go func() {
 		for {
-			log.Printf("Clients %d\n", atomic.LoadInt32(&p.clients))
+			//log.Printf("Clients %d\n", atomic.LoadInt32(&p.clients))
 			time.Sleep(1 * time.Second)
 		}
 	}()
