@@ -107,7 +107,7 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	buffer := p.buffers.Get().([]byte)
 	defer p.buffers.Put(buffer)
 
-	off, err := p.readBuffer(buffer, request.Body)
+	read, err := p.readBuffer(buffer, request.Body)
 	if err != nil {
 		request.Body.Close()
 		p.fail(w, 500, err)
@@ -115,18 +115,20 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	}
 
 	// Request is at least as large as buffer, forward upstream
-	if off == len(buffer) {
-		debugf("Incoming request %s too large for packing (%d bytes), forwarding upstream\n", request.URL.Path, off)
-		request.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer[:off]), request.Body)) // FIXME leaking body
+	if read == len(buffer) {
+		debugf("Incoming request %s too large for packing (%d bytes), forwarding upstream\n", request.URL.Path, read)
+		request.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer[:read]), request.Body)) // FIXME leaking body
 		p.forwardRequest(w, request)
 		return
 	}
 
+	// Request is fully in the buffer now, close request body and start packing
 	if err := request.Body.Close(); err != nil {
-		panic(err)
+		p.fail(w, 500, err)
+		return
 	}
 
-	debugf("Incoming request %s fully read (%d bytes), appending to pack\n", request.URL.Path, off)
+	debugf("Incoming request %s fully read (%d bytes), appending to pack\n", request.URL.Path, read)
 
 	// Determine pack group
 	groupId, err := p.parseGroupId(request)
@@ -147,14 +149,13 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 
 	apack.parts = append(apack.parts, &part{
 		offset: apack.size,
-		data: buffer[:off],
+		data: buffer[:read],
 		response: responseChan,
 	})
-	apack.size += len(buffer[:off]) // Do not reorder, see above!
+	apack.size += len(buffer[:read]) // Do not reorder, see above!
 	apack.timer.Reset(p.config.MaxWait)
 
 	if apack.size > p.config.MinSize {
-		go p.packUpload(apack)
 		delete(p.packs, groupId)
 		apack.done <- true
 	}
@@ -187,13 +188,14 @@ func (p *packer) newPack(groupId string, first *http.Request) *pack {
 		select {
 		case <-apack.timer.C:
 			p.Lock()
-			go p.packUpload(apack)
 			delete(p.packs, groupId)
 			p.Unlock()
 			break
 		case <-apack.done:
 			break
 		}
+
+		go p.packUpload(apack)
 	}()
 
 	return apack
@@ -273,7 +275,8 @@ func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
 
 	proxyResponse, err := p.client.Do(proxyRequest)
 	if err != nil {
-		panic(err)
+		p.fail(w, 500, err)
+		return
 	}
 
 	copyAndWriteResponseHeader(w, proxyResponse)
@@ -295,14 +298,12 @@ func (p *packer) parseGroupId(request *http.Request) (string, error) {
 		if err != nil {
 			return "", err
 		}
-
 		return groupId, nil
 	}
 }
 
 func (p *packer) readBuffer(buffer []byte, reader io.ReadCloser) (int, error) {
 	off := 0
-
 	for off < len(buffer) {
 		read, err := reader.Read(buffer[off:])
 		if err == io.EOF {
@@ -311,10 +312,8 @@ func (p *packer) readBuffer(buffer []byte, reader io.ReadCloser) (int, error) {
 		} else if err != nil {
 			return 0, err
 		}
-
 		off += read
 	}
-
 	return off, nil
 }
 
