@@ -35,22 +35,22 @@ type packer struct {
 	sync.Mutex
 }
 
-type part struct {
-	response chan *http.Response
-	offset   int
-	data     []byte
-}
-
 type pack struct {
 	groupId string
-	packId string
+	packId  string
 
 	firstRequest *http.Request
 	parts        []*part
 	size         int
 
-	timer     *time.Timer
-	done      chan bool
+	timer *time.Timer
+	done  chan bool
+}
+
+type part struct {
+	response chan<- *http.Response
+	offset   int
+	data     []byte
 }
 
 var (
@@ -137,6 +137,7 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
+	// Find pack, append part to it
 	p.Lock()
 	apack, ok := p.packs[groupId]
 	if !ok {
@@ -147,20 +148,14 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	responseChan := make(chan *http.Response)
 	defer close(responseChan)
 
-	apack.parts = append(apack.parts, &part{
-		offset: apack.size,
-		data: buffer[:read],
-		response: responseChan,
-	})
-	apack.size += len(buffer[:read]) // Do not reorder, see above!
-	apack.timer.Reset(p.config.MaxWait)
-
-	if apack.size > p.config.MinSize {
+	full := p.appendPart(apack, buffer[:read], responseChan)
+	if full {
 		delete(p.packs, groupId)
 		apack.done <- true
 	}
 	p.Unlock()
 
+	// Wait for response from packUpload
 	response := <-responseChan
 	debugf("Dispatching response for pack: %s (group %s), request: %s, response: %s\n",
 		apack.packId, apack.groupId, request.URL.Path, response.Status)
@@ -195,7 +190,9 @@ func (p *packer) newPack(groupId string, first *http.Request) *pack {
 			break
 		}
 
-		go p.packUpload(apack)
+		go func() {
+			p.packUpload(apack)
+		}()
 	}()
 
 	return apack
@@ -226,7 +223,7 @@ func (p *packer) packUpload(apack *pack) {
 		panic(err)
 	}
 
-	debugf("Uploading pack %s (group %s) finished, len %d, count %d, status %s\n",
+	debugf("Finished uploading pack %s (group %s), len %d, count %d, status %s\n",
 		apack.packId, apack.groupId, apack.size, len(apack.parts), upstreamResponse.Status)
 
 	var body []byte
@@ -283,6 +280,18 @@ func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
 	if err := writeResponse(w, proxyResponse); err != nil {
 		debugf("Cannot write response to forwarded request: " + err.Error())
 	}
+}
+
+func (p *packer) appendPart(apack *pack, data []byte, responseChan chan<- *http.Response) (full bool) {
+	apack.parts = append(apack.parts, &part{
+		offset: apack.size,
+		data: data,
+		response: responseChan,
+	})
+	apack.size += len(data) // Do not reorder, see above!
+	apack.timer.Reset(p.config.MaxWait)
+
+	return apack.size > p.config.MinSize
 }
 
 func (p *packer) fail(w http.ResponseWriter, status int, err error) {
