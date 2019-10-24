@@ -109,8 +109,8 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 
 	read, err := p.readBuffer(buffer, request.Body)
 	if err != nil {
-		request.Body.Close()
-		p.fail(w, 500, err)
+		request.Body.Close() // Ignore error!
+		http.Error(w, err.Error(), 500)
 		return
 	}
 
@@ -124,7 +124,7 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 
 	// Request is fully in the buffer now, close request body and start packing
 	if err := request.Body.Close(); err != nil {
-		p.fail(w, 500, err)
+		http.Error(w, err.Error(), 500)
 		return
 	}
 
@@ -133,7 +133,7 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	// Determine pack group
 	groupId, err := p.parseGroupId(request)
 	if err != nil {
-		p.fail(w, 400, err)
+		http.Error(w, err.Error(), 400)
 		return
 	}
 
@@ -190,18 +190,28 @@ func (p *packer) newPack(groupId string, first *http.Request) *pack {
 			break
 		}
 
-		go func() {
-			p.packUpload(apack)
-		}()
+		go p.packWorker(apack)
 	}()
 
 	return apack
 }
 
-func (p *packer) packUpload(apack *pack) {
+func (p *packer) packWorker(apack *pack) {
+	response, err := p.packUpload(apack)
+	if err != nil {
+		response = &http.Response{
+			StatusCode: 500,
+			Status: "500 Internal Server Error",
+		}
+	}
+
+	p.dispatchResponses(apack, response)
+}
+
+func (p *packer) packUpload(apack *pack) (*http.Response, error) {
 	prefix, err := parsePrefix(apack.firstRequest.URL.Path)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	uri := fmt.Sprintf("http://%s/%s/%s", p.config.ForwardAddr, prefix, apack.packId)
@@ -214,45 +224,47 @@ func (p *packer) packUpload(apack *pack) {
 
 	upstreamRequest, err := http.NewRequest("PUT", uri, io.MultiReader(readers...))
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	copyRequestHeader(upstreamRequest, apack.firstRequest)
 	upstreamResponse, err := p.client.Do(upstreamRequest)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	debugf("Finished uploading pack %s (group %s), len %d, count %d, status %s\n",
 		apack.packId, apack.groupId, apack.size, len(apack.parts), upstreamResponse.Status)
 
+	return upstreamResponse, nil
+}
+
+func (p *packer) dispatchResponses(apack *pack, response *http.Response) {
 	var body []byte
-	if upstreamResponse.Body != nil {
-		body, err = ioutil.ReadAll(upstreamResponse.Body)
-		if err != nil {
-			panic(err)
+	var err error
+
+	// Read upstream response body
+	if response.Body != nil {
+		if body, err = ioutil.ReadAll(response.Body); err != nil {
+			body = []byte(err.Error())
 		}
-		if err := upstreamResponse.Body.Close(); err != nil {
-			panic(err)
-		}
+		response.Body.Close() // Ignore errors!
 	}
 
+	// Dispatch response to downstream
 	for _, apart := range apack.parts {
-		response := &http.Response{
-			Status: upstreamResponse.Status,
-			StatusCode: upstreamResponse.StatusCode,
-			Header: copyHeader(upstreamResponse.Header),
+		partResponse := &http.Response{
+			Status:     response.Status,
+			StatusCode: response.StatusCode,
+			Header:     copyHeader(response.Header),
 		}
 
-		response.Header.Add("X-Pack-Id", apack.packId)
-		response.Header.Add("X-Item-Offset", fmt.Sprintf("%d", apart.offset))
-		response.Header.Add("X-Item-Length", fmt.Sprintf("%d", len(apart.data)))
+		partResponse.Header.Add("X-Pack-Id", apack.packId)
+		partResponse.Header.Add("X-Item-Offset", fmt.Sprintf("%d", apart.offset))
+		partResponse.Header.Add("X-Item-Length", fmt.Sprintf("%d", len(apart.data)))
+		partResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
 
-		if body != nil {
-			response.Body = ioutil.NopCloser(bytes.NewReader(body))
-		}
-
-		apart.response <- response
+		apart.response <- partResponse
 	}
 }
 
@@ -263,7 +275,7 @@ func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
 
 	proxyRequest, err := http.NewRequest(r.Method, forwardURL.String(), r.Body)
 	if err != nil {
-		p.fail(w, 500, err)
+		http.Error(w, err.Error(), 500)
 		return
 	}
 
@@ -272,7 +284,7 @@ func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
 
 	proxyResponse, err := p.client.Do(proxyRequest)
 	if err != nil {
-		p.fail(w, 500, err)
+		http.Error(w, err.Error(), 500)
 		return
 	}
 
@@ -292,11 +304,6 @@ func (p *packer) appendPart(apack *pack, data []byte, responseChan chan<- *http.
 	apack.timer.Reset(p.config.MaxWait)
 
 	return apack.size > p.config.MinSize
-}
-
-func (p *packer) fail(w http.ResponseWriter, status int, err error) {
-	w.WriteHeader(status)
-	w.Write([]byte(err.Error()))
 }
 
 func (p *packer) parseGroupId(request *http.Request) (string, error) {
