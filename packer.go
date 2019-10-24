@@ -116,7 +116,7 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 
 	// Request is at least as large as buffer, forward upstream
 	if read == len(buffer) {
-		debugf("Incoming request %s too large for packing (%d bytes), forwarding upstream\n", request.URL.Path, read)
+		debugf("Incoming request %s too large for packing (> %d bytes), forwarding upstream\n", request.URL.Path, read)
 		request.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer[:read]), request.Body)) // FIXME leaking body
 		p.forwardRequest(w, request)
 		return
@@ -160,7 +160,6 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	debugf("Dispatching response for pack: %s (group %s), request: %s, response: %s\n",
 		apack.packId, apack.groupId, request.URL.Path, response.Status)
 
-	copyAndWriteResponseHeader(w, response)
 	if err := writeResponse(w, response); err != nil {
 		debugf("Cannot write response: " + err.Error())
 	}
@@ -227,7 +226,7 @@ func (p *packer) packUpload(apack *pack) (*http.Response, error) {
 		return nil, err
 	}
 
-	copyRequestHeader(upstreamRequest, apack.firstRequest)
+	upstreamRequest.Header = apack.firstRequest.Header.Clone()
 	upstreamResponse, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		return nil, err
@@ -256,13 +255,16 @@ func (p *packer) dispatchResponses(apack *pack, response *http.Response) {
 		partResponse := &http.Response{
 			Status:     response.Status,
 			StatusCode: response.StatusCode,
-			Header:     copyHeader(response.Header),
+			Header:     response.Header.Clone(),
 		}
 
 		partResponse.Header.Add("X-Pack-Id", apack.packId)
 		partResponse.Header.Add("X-Item-Offset", fmt.Sprintf("%d", apart.offset))
 		partResponse.Header.Add("X-Item-Length", fmt.Sprintf("%d", len(apart.data)))
-		partResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
+
+		if body != nil {
+			partResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
+		}
 
 		apart.response <- partResponse
 	}
@@ -279,7 +281,7 @@ func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	copyRequestHeader(proxyRequest, r)
+	proxyRequest.Header = r.Header.Clone()
 	proxyRequest.Header.Set("Host", r.Host)
 
 	proxyResponse, err := p.client.Do(proxyRequest)
@@ -288,7 +290,6 @@ func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	copyAndWriteResponseHeader(w, proxyResponse)
 	if err := writeResponse(w, proxyResponse); err != nil {
 		debugf("Cannot write response to forwarded request: " + err.Error())
 	}
@@ -350,36 +351,17 @@ func parsePrefix(path string) (prefix string, err error) {
 	return matches[1], nil
 }
 
-func copyRequestHeader(to *http.Request, from *http.Request) {
-	for header, values := range from.Header {
-		for _, value := range values {
-			to.Header.Add(header, value)
-		}
-	}
-}
-
-func copyAndWriteResponseHeader(w http.ResponseWriter, from *http.Response) {
-	for header, values := range from.Header {
+func writeResponse(w http.ResponseWriter, response *http.Response) error {
+	// Write headers
+	for header, values := range response.Header {
 		for _, value := range values {
 			w.Header().Add(header, value)
 		}
 	}
 
-	w.WriteHeader(from.StatusCode)
-}
+	w.WriteHeader(response.StatusCode)
 
-func copyHeader(from http.Header) http.Header {
-	to := http.Header{}
-	for header, values := range from {
-		for _, value := range values {
-			to.Add(header, value)
-		}
-	}
-	return to
-}
-
-
-func writeResponse(w http.ResponseWriter, response *http.Response) error {
+	// Write and close body
 	if _, err := io.Copy(w, response.Body); err != nil {
 		return err
 	}
