@@ -53,6 +53,11 @@ type pack struct {
 	done      chan bool
 }
 
+var (
+	hexCharset = []rune("0123456789abcdef")
+	prefixRegex = regexp.MustCompile(`^/(v1/[^/]+/[^/]+)/.+$`)
+)
+
 func NewPacker(config *Config) Packer {
 	return &packer{
 		config:  config,
@@ -102,19 +107,11 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	buffer := p.buffers.Get().([]byte)
 	defer p.buffers.Put(buffer)
 
-	off := 0
-	for off < len(buffer) {
-		read, err := request.Body.Read(buffer[off:])
-		if err == io.EOF {
-			off += read
-			break
-		} else if err != nil {
-			request.Body.Close()
-			w.WriteHeader(500)
-			return
-		}
-
-		off += read
+	off, err := p.readBuffer(buffer, request.Body)
+	if err != nil {
+		request.Body.Close()
+		p.fail(w, 500, err)
+		return
 	}
 
 	// Request is at least as large as buffer, forward upstream
@@ -137,7 +134,7 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 		p.fail(w, 400, err)
 		return
 	}
-	
+
 	p.Lock()
 	apack, ok := p.packs[groupId]
 	if !ok {
@@ -303,8 +300,23 @@ func (p *packer) parseGroupId(request *http.Request) (string, error) {
 	}
 }
 
-var hexCharset = []rune("0123456789abcdef")
-var prefixRegex = regexp.MustCompile(`^/(v1/[^/]+/[^/]+)/.+$`)
+func (p *packer) readBuffer(buffer []byte, reader io.ReadCloser) (int, error) {
+	off := 0
+
+	for off < len(buffer) {
+		read, err := reader.Read(buffer[off:])
+		if err == io.EOF {
+			off += read
+			break
+		} else if err != nil {
+			return 0, err
+		}
+
+		off += read
+	}
+
+	return off, nil
+}
 
 func randomHexChars(n int) string {
 	b := make([]rune, n)
@@ -340,7 +352,6 @@ func copyAndWriteResponseHeader(w http.ResponseWriter, from *http.Response) {
 
 	w.WriteHeader(from.StatusCode)
 }
-
 
 func copyHeader(from http.Header) http.Header {
 	to := http.Header{}
