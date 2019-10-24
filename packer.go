@@ -37,13 +37,14 @@ type packer struct {
 
 type pack struct {
 	config  *Config
+	client *http.Client
+
 	groupId string
 	packId  string
 
 	first *http.Request
 	parts []*part
 	size  int
-	full  bool
 
 	timer *time.Timer
 	done  chan bool
@@ -146,8 +147,8 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	responseChan := make(chan *http.Response)
 	defer close(responseChan)
 
-	p.appendPart(apack, buffer[:read], responseChan)
-	if apack.full {
+	apack.append(buffer[:read], responseChan)
+	if apack.full() {
 		p.deletePack(apack.groupId)
 		apack.done <- true
 	}
@@ -172,13 +173,14 @@ func (p *packer) createOrGetPack(groupId string, first *http.Request) *pack {
 
 	apack = &pack{
 		config:  p.config,
+		client:  p.client,
+
 		groupId: groupId,
 		packId:  randomHexChars(32),
 
 		first: first,
 		parts: make([]*part, 0),
 		size:  0,
-		full:  false,
 
 		timer:     time.NewTimer(p.config.MaxWait),
 		done:      make(chan bool),
@@ -195,7 +197,7 @@ func (p *packer) createOrGetPack(groupId string, first *http.Request) *pack {
 			break
 		}
 
-		go p.packWorker(apack)
+		go apack.packWorker()
 	}()
 
 	p.packs[groupId] = apack
@@ -206,8 +208,8 @@ func (p *packer) deletePack(groupId string) {
 	delete(p.packs, groupId)
 }
 
-func (p *packer) packWorker(apack *pack) {
-	response, err := p.packUpload(apack)
+func (p *pack) packWorker() {
+	response, err := p.packUpload()
 	if err != nil {
 		response = &http.Response{
 			StatusCode: 500,
@@ -215,20 +217,20 @@ func (p *packer) packWorker(apack *pack) {
 		}
 	}
 
-	p.dispatchResponses(apack, response)
+	p.sendResponses(response)
 }
 
-func (p *packer) packUpload(apack *pack) (*http.Response, error) {
-	prefix, err := parsePrefix(apack.first.URL.Path)
+func (p *pack) packUpload() (*http.Response, error) {
+	prefix, err := parsePrefix(p.first.URL.Path)
 	if err != nil {
 		return nil, err
 	}
 
-	uri := fmt.Sprintf("http://%s/%s/%s", p.config.ForwardAddr, prefix, apack.packId)
-	debugf("Uploading pack %s (group %s) to %s\n", apack.packId, apack.groupId, uri)
+	uri := fmt.Sprintf("http://%s/%s/%s", p.config.ForwardAddr, prefix, p.packId)
+	debugf("Uploading pack %s (group %s) to %s\n", p.packId, p.groupId, uri)
 
 	readers := make([]io.Reader, 0)
-	for _, apart := range apack.parts {
+	for _, apart := range p.parts {
 		readers = append(readers, bytes.NewReader(apart.data))
 	}
 
@@ -237,19 +239,19 @@ func (p *packer) packUpload(apack *pack) (*http.Response, error) {
 		return nil, err
 	}
 
-	upstreamRequest.Header = apack.first.Header.Clone()
+	upstreamRequest.Header = p.first.Header.Clone()
 	upstreamResponse, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		return nil, err
 	}
 
 	debugf("Finished uploading pack %s (group %s), len %d, count %d, status %s\n",
-		apack.packId, apack.groupId, apack.size, len(apack.parts), upstreamResponse.Status)
+		p.packId, p.groupId, p.size, len(p.parts), upstreamResponse.Status)
 
 	return upstreamResponse, nil
 }
 
-func (p *packer) dispatchResponses(apack *pack, response *http.Response) {
+func (p *pack) sendResponses(response *http.Response) {
 	var body []byte
 	var err error
 
@@ -262,14 +264,14 @@ func (p *packer) dispatchResponses(apack *pack, response *http.Response) {
 	}
 
 	// Dispatch response to downstream
-	for _, apart := range apack.parts {
+	for _, apart := range p.parts {
 		partResponse := &http.Response{
 			Status:     response.Status,
 			StatusCode: response.StatusCode,
 			Header:     response.Header.Clone(),
 		}
 
-		partResponse.Header.Add("X-Pack-Id", apack.packId)
+		partResponse.Header.Add("X-Pack-Id", p.packId)
 		partResponse.Header.Add("X-Item-Offset", fmt.Sprintf("%d", apart.offset))
 		partResponse.Header.Add("X-Item-Length", fmt.Sprintf("%d", len(apart.data)))
 
@@ -306,15 +308,19 @@ func (p *packer) forwardRequest(w http.ResponseWriter, request *http.Request) {
 	}
 }
 
-func (p *packer) appendPart(apack *pack, data []byte, responseChan chan<- *http.Response) {
-	apack.parts = append(apack.parts, &part{
-		offset: apack.size,
+func (p *pack) append(data []byte, responseChan chan<- *http.Response) {
+	offset := p.size
+	p.size += len(data)
+	p.parts = append(p.parts, &part{
+		offset: offset,
 		data: data,
 		response: responseChan,
 	})
-	apack.size += len(data) // Do not reorder, see above!
-	apack.timer.Reset(p.config.MaxWait)
-	apack.full = apack.size > p.config.MinSize
+	p.timer.Reset(p.config.MaxWait)
+}
+
+func (p *pack) full() bool {
+	return p.size > p.config.MinSize
 }
 
 func (p *packer) parseGroupId(request *http.Request) (string, error) {
