@@ -36,12 +36,14 @@ type packer struct {
 }
 
 type pack struct {
+	config  *Config
 	groupId string
 	packId  string
 
-	firstRequest *http.Request
-	parts        []*part
-	size         int
+	first *http.Request
+	parts []*part
+	size  int
+	full  bool
 
 	timer *time.Timer
 	done  chan bool
@@ -95,7 +97,7 @@ func (p *packer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt32(&p.clients, 1)
 	defer atomic.AddInt32(&p.clients, -1)
 
-	if r.Method == "PUT" && r.Header.Get("X-Pack") == "yes" {
+	if r.Method == http.MethodPut && r.Header.Get("X-Pack") == "yes" {
 		p.handlePut(w, r)
 	} else {
 		p.forwardRequest(w, r)
@@ -139,24 +141,21 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 
 	// Find pack, append part to it
 	p.Lock()
-	apack, ok := p.packs[groupId]
-	if !ok {
-		apack = p.newPack(groupId, request)
-		p.packs[groupId] = apack
-	}
+	apack := p.createOrGetPack(groupId, request)
 
 	responseChan := make(chan *http.Response)
 	defer close(responseChan)
 
-	full := p.appendPart(apack, buffer[:read], responseChan)
-	if full {
-		delete(p.packs, groupId)
+	p.appendPart(apack, buffer[:read], responseChan)
+	if apack.full {
+		p.deletePack(apack.groupId)
 		apack.done <- true
 	}
 	p.Unlock()
 
 	// Wait for response from packUpload
 	response := <-responseChan
+
 	debugf("Dispatching response for pack: %s (group %s), request: %s, response: %s\n",
 		apack.packId, apack.groupId, request.URL.Path, response.Status)
 
@@ -165,14 +164,21 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	}
 }
 
-func (p *packer) newPack(groupId string, first *http.Request) *pack {
-	apack := &pack{
-		groupId:   groupId,
-		packId:    randomHexChars(32),
+func (p *packer) createOrGetPack(groupId string, first *http.Request) *pack {
+	apack, ok := p.packs[groupId]
+	if ok {
+		return apack
+	}
 
-		firstRequest: first,
-		parts:        make([]*part, 0),
-		size:         0,
+	apack = &pack{
+		config:  p.config,
+		groupId: groupId,
+		packId:  randomHexChars(32),
+
+		first: first,
+		parts: make([]*part, 0),
+		size:  0,
+		full:  false,
 
 		timer:     time.NewTimer(p.config.MaxWait),
 		done:      make(chan bool),
@@ -182,7 +188,7 @@ func (p *packer) newPack(groupId string, first *http.Request) *pack {
 		select {
 		case <-apack.timer.C:
 			p.Lock()
-			delete(p.packs, groupId)
+			p.deletePack(groupId)
 			p.Unlock()
 			break
 		case <-apack.done:
@@ -192,7 +198,12 @@ func (p *packer) newPack(groupId string, first *http.Request) *pack {
 		go p.packWorker(apack)
 	}()
 
+	p.packs[groupId] = apack
 	return apack
+}
+
+func (p *packer) deletePack(groupId string) {
+	delete(p.packs, groupId)
 }
 
 func (p *packer) packWorker(apack *pack) {
@@ -208,7 +219,7 @@ func (p *packer) packWorker(apack *pack) {
 }
 
 func (p *packer) packUpload(apack *pack) (*http.Response, error) {
-	prefix, err := parsePrefix(apack.firstRequest.URL.Path)
+	prefix, err := parsePrefix(apack.first.URL.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +237,7 @@ func (p *packer) packUpload(apack *pack) (*http.Response, error) {
 		return nil, err
 	}
 
-	upstreamRequest.Header = apack.firstRequest.Header.Clone()
+	upstreamRequest.Header = apack.first.Header.Clone()
 	upstreamResponse, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		return nil, err
@@ -270,19 +281,19 @@ func (p *packer) dispatchResponses(apack *pack, response *http.Response) {
 	}
 }
 
-func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
-	forwardURL := r.URL
+func (p *packer) forwardRequest(w http.ResponseWriter, request *http.Request) {
+	forwardURL := request.URL
 	forwardURL.Scheme = "http"
 	forwardURL.Host = p.config.ForwardAddr
 
-	proxyRequest, err := http.NewRequest(r.Method, forwardURL.String(), r.Body)
+	proxyRequest, err := http.NewRequest(request.Method, forwardURL.String(), request.Body)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
-	proxyRequest.Header = r.Header.Clone()
-	proxyRequest.Header.Set("Host", r.Host)
+	proxyRequest.Header = request.Header.Clone()
+	proxyRequest.Header.Set("Host", request.Host)
 
 	proxyResponse, err := p.client.Do(proxyRequest)
 	if err != nil {
@@ -295,7 +306,7 @@ func (p *packer) forwardRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *packer) appendPart(apack *pack, data []byte, responseChan chan<- *http.Response) (full bool) {
+func (p *packer) appendPart(apack *pack, data []byte, responseChan chan<- *http.Response) {
 	apack.parts = append(apack.parts, &part{
 		offset: apack.size,
 		data: data,
@@ -303,8 +314,7 @@ func (p *packer) appendPart(apack *pack, data []byte, responseChan chan<- *http.
 	})
 	apack.size += len(data) // Do not reorder, see above!
 	apack.timer.Reset(p.config.MaxWait)
-
-	return apack.size > p.config.MinSize
+	apack.full = apack.size > p.config.MinSize
 }
 
 func (p *packer) parseGroupId(request *http.Request) (string, error) {
