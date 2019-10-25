@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -32,7 +31,6 @@ type Config struct {
 type packer struct {
 	config  *Config
 	client  *http.Client
-	clients int32
 	buffers *sync.Pool
 	packs   map[string]*pack
 	sync.Mutex
@@ -54,7 +52,6 @@ func NewPacker(config *Config) (Packer, error) {
 	return &packer{
 		config:  newConfig,
 		client:  &http.Client{},
-		clients: 0,
 		buffers: &sync.Pool{
 			New: func() interface{} {
 				b := make([]byte, config.MinSize)
@@ -73,24 +70,16 @@ func (p *packer) ListenAndServe() error {
 		Handler: p,
 	}
 
-	go func() {
-		for {
-			//log.Printf("Clients %d\n", atomic.LoadInt32(&p.clients))
-			time.Sleep(1 * time.Second)
-		}
-	}()
-
 	return server.ListenAndServe()
 }
 
 func (p *packer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	atomic.AddInt32(&p.clients, 1)
-	defer atomic.AddInt32(&p.clients, -1)
-
 	if r.Method == http.MethodPut && r.Header.Get("X-Allow-Pack") == "yes" {
 		p.handlePUT(w, r)
 	} else if r.Method == http.MethodGet {
 		p.handleGET(w, r)
+	} else if r.Method == http.MethodDelete {
+		p.handleDELETE(w, r)
 	} else {
 		p.forwardRequest(w, r)
 	}
@@ -233,6 +222,74 @@ func (p *packer) handleGET(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := writeResponse(w, getResponse); err != nil {
+		debugf("Cannot write response: " + err.Error())
+	}
+}
+
+func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) {
+	account, container, object, err := parseRequestParts(r.URL.Path)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	packItemParts := packItemRegex.FindStringSubmatch(object)
+	if len(packItemParts) != 4 || packItemParts[1] != p.config.Prefix {
+		p.forwardRequest(w, r)
+		return
+	}
+
+	packId := packItemParts[2]
+	itemId, err := strconv.Atoi(packItemParts[3])
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	packUri := fmt.Sprintf("http://%s/v1/%s/%s/%s/%s", p.config.ForwardAddr, account, container, p.config.Prefix, packId)
+	headRequest, err := http.NewRequest(http.MethodHead, packUri, nil)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	headRequest.Header = r.Header.Clone()
+	headResponse, err := p.client.Do(headRequest)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	meta := headResponse.Header.Get("X-Object-Meta-Pack")
+	if meta == "" {
+		http.Error(w, "Pack file does not contain X-Object-Meta-Pack header", 500)
+		return
+	}
+
+	packMetaParts := strings.Split(meta, ",")
+	if itemId < 0 || itemId > len(packMetaParts)-1 {
+		http.Error(w, "Invalid pack item", 400)
+		return
+	}
+	packMetaParts[itemId] = ""
+
+	// Update X-Object-Meta-Pack (remove item range)
+	postRequest, err := http.NewRequest(http.MethodPost, packUri, nil)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	postRequest.Header = r.Header.Clone()
+	postRequest.Header.Set("X-Object-Meta-Pack", strings.Join(packMetaParts, ","))
+
+	postResponse, err := p.client.Do(postRequest)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	if err := writeResponse(w, postResponse); err != nil {
 		debugf("Cannot write response: " + err.Error())
 	}
 }
