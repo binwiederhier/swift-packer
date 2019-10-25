@@ -232,7 +232,7 @@ func (p *packer) handleGET(w http.ResponseWriter, r *http.Request) (int, error) 
 		debugf("Cannot write response: " + err.Error())
 	}
 
-	logf("GET /v1/%s/%s/%s/%s type=range item=%d status=%s\n",
+	logf("GET /v1/%s/%s/%s/%s type=range item=%s status=%s\n",
 		account, container, p.config.Prefix, packId, getResponse.Status)
 
 	return 0, nil
@@ -322,7 +322,7 @@ func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) (int, erro
 		}
 
 		logf("DELETE /v1/%s/%s/%s/%s type=logical item=%d status=%s\n",
-			account, container, p.config.Prefix, packId, postResponse.Status)
+			account, container, p.config.Prefix, packId, itemId, postResponse.Status)
 	} else {
 		// Get all bytes for non-empty ranges from backend
 		getRequestRangeBytes := make([]string, 0)
@@ -435,7 +435,7 @@ func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) (int, erro
 		}
 
 		logf("DELETE /v1/%s/%s/%s/%s type=repack item=%d status=%s\n",
-			account, container, p.config.Prefix, packId, putResponse.Status)
+			account, container, p.config.Prefix, packId, itemId, putResponse.Status)
 	}
 
 	return 0, nil
