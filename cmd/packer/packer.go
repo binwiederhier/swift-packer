@@ -17,6 +17,7 @@ func main() {
 	listenAddrFlag := flag.String("listen", ":1234", "Listen address for packer service")
 	minSizeFlag := flag.String("minsize", "128k", "Minimum pack size")
 	maxWaitFlag := flag.Int("maxwait", 100, "Wait time in milliseconds for downstream PUTs before closing pack")
+	maxCountFlag := flag.Int("maxcount", 10, "Max items per pack")
 	debugFlag := flag.Bool("debug", false, "Enable debug mode")
 	quietFlag := flag.Bool("quiet", false, "Do not output anything")
 	flag.Parse()
@@ -35,12 +36,16 @@ func main() {
 	packer.Quiet = *quietFlag
 	packer.Debug = *debugFlag
 
-	packer := packer.NewPacker(&packer.Config{
-		ListenAddr:  *listenAddrFlag,
+	packer, err := packer.NewPacker(&packer.Config{
 		ForwardAddr: forwardAddr,
+		ListenAddr:  *listenAddrFlag,
 		MinSize:     minSize,
 		MaxWait:     time.Duration(*maxWaitFlag) * time.Millisecond,
+		MaxCount:    *maxCountFlag,
 	})
+	if err != nil {
+		exit(3, err.Error())
+	}
 
 	log.Fatalln(packer.ListenAndServe())
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -15,6 +16,9 @@ type pack struct {
 
 	groupId string
 	packId  string
+
+	account   string
+	container string
 
 	first *http.Request
 	parts []*part
@@ -33,9 +37,11 @@ type part struct {
 func (p *pack) packWorker() {
 	response, err := p.packUpload()
 	if err != nil {
+		debugf(err.Error())
 		response = &http.Response{
 			StatusCode: 500,
 			Status: "500 Internal Server Error",
+			Header: http.Header{},
 		}
 	}
 
@@ -43,31 +49,33 @@ func (p *pack) packWorker() {
 }
 
 func (p *pack) packUpload() (*http.Response, error) {
-	prefix, err := parsePrefix(p.first.URL.Path)
-	if err != nil {
-		return nil, err
-	}
-
-	uri := fmt.Sprintf("http://%s/%s/%s", p.config.ForwardAddr, prefix, p.packId)
-	debugf("Uploading pack %s (group %s) to %s\n", p.packId, p.groupId, uri)
+	uri := fmt.Sprintf("http://%s/v1/%s/%s/%s/%s", p.config.ForwardAddr, p.account, p.container, p.config.Prefix, p.packId)
 
 	readers := make([]io.Reader, 0)
 	for _, apart := range p.parts {
 		readers = append(readers, bytes.NewReader(apart.data))
 	}
 
-	upstreamRequest, err := http.NewRequest("PUT", uri, io.MultiReader(readers...))
+	upstreamRequest, err := http.NewRequest(http.MethodPut, uri, io.MultiReader(readers...))
 	if err != nil {
 		return nil, err
 	}
 
+	meta := make([]string, 0)
+	for _, apart := range p.parts {
+		meta = append(meta, fmt.Sprintf("%d-%d", apart.offset, apart.offset + len(apart.data)))
+	}
+
 	upstreamRequest.Header = p.first.Header.Clone()
+	upstreamRequest.Header.Set("X-Object-Meta-Pack", strings.Join(meta, ","))
+
+	debugf("[group %s] PUT /v1/%s/%s/%s/%s %s \n", p.groupId, p.account, p.container, p.config.Prefix, p.packId)
 	upstreamResponse, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		return nil, err
 	}
 
-	debugf("Finished uploading pack %s (group %s), len %d, count %d, status %s\n",
+	debugf("[group %s] Finished uploading pack %s (group %s), len %d, count %d, status %s\n",
 		p.packId, p.groupId, p.size, len(p.parts), upstreamResponse.Status)
 
 	return upstreamResponse, nil
@@ -86,16 +94,17 @@ func (p *pack) sendResponses(response *http.Response) {
 	}
 
 	// Dispatch response to downstream
-	for _, apart := range p.parts {
+	packPath := fmt.Sprintf("%s/%s/%s/%s", p.account, p.container, p.config.Prefix, p.packId)
+
+	for i, apart := range p.parts {
 		partResponse := &http.Response{
 			Status:     response.Status,
 			StatusCode: response.StatusCode,
 			Header:     response.Header.Clone(),
 		}
 
-		partResponse.Header.Add("X-Pack-Id", p.packId)
-		partResponse.Header.Add("X-Item-Offset", fmt.Sprintf("%d", apart.offset))
-		partResponse.Header.Add("X-Item-Length", fmt.Sprintf("%d", len(apart.data)))
+		partResponse.Header.Add("X-Pack-Path", packPath)
+		partResponse.Header.Add("X-Item-Path", fmt.Sprintf("%s/%d", packPath, i))
 
 		if body != nil {
 			partResponse.Body = ioutil.NopCloser(bytes.NewReader(body))
@@ -117,5 +126,5 @@ func (p *pack) append(data []byte, responseChan chan<- *http.Response) {
 }
 
 func (p *pack) full() bool {
-	return p.size > p.config.MinSize
+	return p.size > p.config.MinSize || len(p.parts) >= p.config.MaxCount
 }

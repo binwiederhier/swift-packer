@@ -3,11 +3,14 @@ package packer
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,10 +21,12 @@ type Packer interface {
 }
 
 type Config struct {
-	ListenAddr  string
 	ForwardAddr string
+	ListenAddr  string
 	MinSize     int
 	MaxWait     time.Duration
+	MaxCount    int
+	Prefix      string
 }
 
 type packer struct {
@@ -34,14 +39,20 @@ type packer struct {
 }
 
 var (
-	hexCharset = []rune("0123456789abcdef")
-	prefixRegex = regexp.MustCompile(`^/(v1/[^/]+/[^/]+)/.+$`)
+	hexCharset                  = []rune("0123456789abcdef")
+	accountContainerObjectRegex = regexp.MustCompile(`^/v1/([^/]+)/([^/]+)/(.+)$`)
+	packItemRegex               = regexp.MustCompile(`^([^/]+)/([^/]+)/(\d+)$`)
 )
 
-func NewPacker(config *Config) Packer {
+func NewPacker(config *Config) (Packer, error) {
+	newConfig, err := copyWithDefaults(config)
+	if err != nil {
+		return nil, err
+	}
+
 	//Debug = true
 	return &packer{
-		config:  config,
+		config:  newConfig,
 		client:  &http.Client{},
 		clients: 0,
 		buffers: &sync.Pool{
@@ -51,7 +62,7 @@ func NewPacker(config *Config) Packer {
 			},
 		},
 		packs: make(map[string]*pack),
-	}
+	}, nil
 }
 
 func (p *packer) ListenAndServe() error {
@@ -76,14 +87,16 @@ func (p *packer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt32(&p.clients, 1)
 	defer atomic.AddInt32(&p.clients, -1)
 
-	if r.Method == http.MethodPut && r.Header.Get("X-Pack") == "yes" {
-		p.handlePut(w, r)
+	if r.Method == http.MethodPut && r.Header.Get("X-Allow-Pack") == "yes" {
+		p.handlePUT(w, r)
+	} else if r.Method == http.MethodGet {
+		p.handleGET(w, r)
 	} else {
 		p.forwardRequest(w, r)
 	}
 }
 
-func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
+func (p *packer) handlePUT(w http.ResponseWriter, request *http.Request) {
 	// Read up to buffer size into memory
 	buffer := p.buffers.Get().([]byte)
 	defer p.buffers.Put(buffer)
@@ -120,7 +133,7 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 
 	// Find pack, append part to it
 	p.Lock()
-	apack := p.createOrGetPack(groupId, request)
+	apack, err := p.createOrGetPack(groupId, request)
 
 	responseChan := make(chan *http.Response)
 	defer close(responseChan)
@@ -143,10 +156,96 @@ func (p *packer) handlePut(w http.ResponseWriter, request *http.Request) {
 	}
 }
 
-func (p *packer) createOrGetPack(groupId string, first *http.Request) *pack {
+func (p *packer) handleGET(w http.ResponseWriter, r *http.Request) {
+	account, container, object, err := parseRequestParts(r.URL.Path)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	packItemParts := packItemRegex.FindStringSubmatch(object)
+	if len(packItemParts) != 4 || packItemParts[1] != p.config.Prefix {
+		p.forwardRequest(w, r)
+		return
+	}
+
+	packId := packItemParts[2]
+	itemId, err := strconv.Atoi(packItemParts[3])
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	packUri := fmt.Sprintf("http://%s/v1/%s/%s/%s/%s", p.config.ForwardAddr, account, container, p.config.Prefix, packId)
+	headRequest, err := http.NewRequest(http.MethodHead, packUri, nil)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	headRequest.Header = r.Header.Clone()
+	headResponse, err := p.client.Do(headRequest)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	meta := headResponse.Header.Get("X-Object-Meta-Pack")
+	if meta == "" {
+		http.Error(w, "Pack file does not contain X-Object-Meta-Pack header", 500)
+		return
+	}
+
+	itemRange := ""
+	packMetaParts := strings.Split(meta, ",")
+	for currentItemId, currentItemRange := range packMetaParts {
+		if currentItemId == itemId && currentItemRange != "" {
+			itemRange = currentItemRange
+			break
+		}
+	}
+
+	if itemRange == "" {
+		http.Error(w, "Requested item does not exist in pack", 404)
+		return
+	}
+
+	getRequest, err := http.NewRequest(http.MethodGet, packUri, nil)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	getRequest.Header = r.Header.Clone()
+	getRequest.Header.Set("Range", fmt.Sprintf("bytes=%s", itemRange))
+
+	getResponse, err := p.client.Do(getRequest)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	if getResponse.StatusCode == http.StatusPartialContent {
+		getResponse.StatusCode = http.StatusOK
+		getResponse.Status = http.StatusText(http.StatusOK)
+		getResponse.Header.Del("Content-Range")
+		getResponse.Header.Del("X-Object-Meta-Pack")
+	}
+
+	if err := writeResponse(w, getResponse); err != nil {
+		debugf("Cannot write response: " + err.Error())
+	}
+}
+
+func (p *packer) createOrGetPack(groupId string, first *http.Request) (*pack, error) {
 	apack, ok := p.packs[groupId]
 	if ok {
-		return apack
+		return apack, nil
+	}
+
+	account, container, _, err := parseRequestParts(first.URL.Path)
+	if err != nil {
+		return nil, err
 	}
 
 	apack = &pack{
@@ -155,6 +254,9 @@ func (p *packer) createOrGetPack(groupId string, first *http.Request) *pack {
 
 		groupId: groupId,
 		packId:  randomHexChars(32),
+
+		account:   account,
+		container: container,
 
 		first: first,
 		parts: make([]*part, 0),
@@ -179,7 +281,7 @@ func (p *packer) createOrGetPack(groupId string, first *http.Request) *pack {
 	}()
 
 	p.packs[groupId] = apack
-	return apack
+	return apack, nil
 }
 
 func (p *packer) deletePack(groupId string) {
@@ -215,11 +317,11 @@ func (p *packer) parseGroupId(request *http.Request) (string, error) {
 	if request.Header.Get("X-Pack-Group") != "" {
 		return request.Header.Get("X-Pack-Group"), nil
 	} else {
-		groupId, err := parsePrefix(request.URL.Path)
+		account, container, _, err := parseRequestParts(request.URL.Path)
 		if err != nil {
 			return "", err
 		}
-		return groupId, nil
+		return fmt.Sprintf("%s/%s", account, container), nil
 	}
 }
 
@@ -238,6 +340,45 @@ func (p *packer) readBuffer(buffer []byte, reader io.ReadCloser) (int, error) {
 	return off, nil
 }
 
+func copyWithDefaults(config *Config) (*Config, error) {
+	// Validate mandatory fields
+	if config.ForwardAddr == "" {
+		return nil, errors.New("forwarding address must be set")
+	}
+
+	// Create prepopulated config and override fields
+	newConfig := &Config{
+		ForwardAddr: config.ForwardAddr,
+		ListenAddr:  ":1234",
+		MinSize:     128 * 1024,
+		MaxWait:     100 * time.Millisecond,
+		MaxCount:    50,
+		Prefix:      ":pack",
+	}
+
+	if config.ListenAddr != "" {
+		newConfig.ListenAddr = config.ListenAddr
+	}
+
+	if config.MinSize != 0 {
+		newConfig.MinSize = config.MinSize
+	}
+
+	if config.MaxWait != 0 {
+		newConfig.MaxWait = config.MaxWait
+	}
+
+	if config.MaxCount != 0 {
+		newConfig.MaxCount = config.MaxCount
+	}
+
+	if config.Prefix != "" {
+		newConfig.Prefix = config.Prefix
+	}
+
+	return newConfig, nil
+}
+
 func randomHexChars(n int) string {
 	b := make([]rune, n)
 	for i := range b {
@@ -246,13 +387,13 @@ func randomHexChars(n int) string {
 	return string(b)
 }
 
-func parsePrefix(path string) (prefix string, err error) {
-	matches := prefixRegex.FindStringSubmatch(path)
-	if matches == nil || len(matches) != 2 {
-		return "", errors.New("unable to parse path into account/container")
+func parseRequestParts(path string) (string, string, string, error) {
+	matches := accountContainerObjectRegex.FindStringSubmatch(path)
+	if matches == nil || len(matches) != 4 {
+		return "", "", "", errors.New("unable to parse path into account/container/object")
 	}
 
-	return matches[1], nil
+	return matches[1], matches[2], matches[3], nil
 }
 
 func writeResponse(w http.ResponseWriter, response *http.Response) error {
