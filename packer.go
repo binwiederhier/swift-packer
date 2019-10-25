@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"mime"
 	"mime/multipart"
@@ -40,11 +41,17 @@ type packer struct {
 }
 
 var (
+	Debug                       = false // TODO Proper log levels
+
 	hexCharset                  = []rune("0123456789abcdef")
 	accountContainerObjectRegex = regexp.MustCompile(`^/v1/([^/]+)/([^/]+)/(.+)$`)
 	packItemRegex               = regexp.MustCompile(`^([^/]+)/([^/]+)/(\d+)$`)
 	itemRangeRegex              = regexp.MustCompile(`^(\d+)-(\d+)$`)
 )
+
+func init() {
+	log.SetFlags(log.Lmicroseconds)
+}
 
 func NewPacker(config *Config) (Packer, error) {
 	newConfig, err := copyWithDefaults(config)
@@ -52,7 +59,6 @@ func NewPacker(config *Config) (Packer, error) {
 		return nil, err
 	}
 
-	//Debug = true
 	return &packer{
 		config:  newConfig,
 		client:  &http.Client{},
@@ -78,6 +84,7 @@ func (p *packer) ListenAndServe() error {
 		}),
 	}
 
+	logf("Listening on %s\n", p.config.ListenAddr)
 	return server.ListenAndServe()
 }
 
@@ -106,7 +113,7 @@ func (p *packer) handlePUT(w http.ResponseWriter, request *http.Request) (int, e
 
 	// Request is at least as large as buffer, forward upstream
 	if read == len(buffer) {
-		debugf("Incoming request %s too large for packing (> %d bytes), forwarding upstream\n", request.URL.Path, read)
+		debugf("Incoming PUT %s too large for packing (> %d bytes), forwarding upstream\n", request.URL.Path, read)
 		request.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer[:read]), request.Body)) // FIXME leaking body
 		return p.forwardRequest(w, request)
 	}
@@ -116,7 +123,7 @@ func (p *packer) handlePUT(w http.ResponseWriter, request *http.Request) (int, e
 		return 500, err
 	}
 
-	debugf("Incoming request %s fully read (%d bytes), appending to pack\n", request.URL.Path, read)
+	debugf("Incoming PUT %s fully read (%d bytes), appending to pack\n", request.URL.Path, read)
 
 	// Determine pack group
 	groupId, err := p.parseGroupId(request)
@@ -144,7 +151,7 @@ func (p *packer) handlePUT(w http.ResponseWriter, request *http.Request) (int, e
 	// Wait for response from packUpload
 	response := <-responseChan
 
-	debugf("Dispatching response for pack: %s (group %s), request: %s, response: %s\n",
+	debugf("Dispatching response for %s, packed in %s (group %s), response: %s\n",
 		apack.packId, apack.groupId, request.URL.Path, response.Status)
 
 	if err := writeResponse(w, response); err != nil {
@@ -224,6 +231,9 @@ func (p *packer) handleGET(w http.ResponseWriter, r *http.Request) (int, error) 
 	if err := writeResponse(w, getResponse); err != nil {
 		debugf("Cannot write response: " + err.Error())
 	}
+
+	logf("GET /v1/%s/%s/%s/%s type=range item=%d status=%s\n",
+		account, container, p.config.Prefix, packId, getResponse.Status)
 
 	return 0, nil
 }
@@ -310,6 +320,9 @@ func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) (int, erro
 		if err := writeResponse(w, postResponse); err != nil {
 			debugf("Cannot write response: " + err.Error())
 		}
+
+		logf("DELETE /v1/%s/%s/%s/%s type=logical item=%d status=%s\n",
+			account, container, p.config.Prefix, packId, postResponse.Status)
 	} else {
 		// Get all bytes for non-empty ranges from backend
 		getRequestRangeBytes := make([]string, 0)
@@ -411,7 +424,7 @@ func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) (int, erro
 		putRequest.Header = r.Header.Clone()
 		putRequest.Header.Set("X-Object-Meta-Pack", strings.Join(newPackMetaParts, ","))
 
-		debugf("[group %s] PUT /v1/%s %s \n", packPath, strings.Join(newPackMetaParts, ","))
+		debugf("PUT /v1/%s (group %s) \n", packPath, strings.Join(newPackMetaParts, ","))
 		putResponse, err := p.client.Do(putRequest)
 		if err != nil {
 			return 500, err
@@ -420,6 +433,9 @@ func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) (int, erro
 		if err := writeResponse(w, putResponse); err != nil {
 			debugf("Cannot write response: " + err.Error())
 		}
+
+		logf("DELETE /v1/%s/%s/%s/%s type=repack item=%d status=%s\n",
+			account, container, p.config.Prefix, packId, putResponse.Status)
 	}
 
 	return 0, nil
@@ -609,4 +625,14 @@ func writeResponse(w http.ResponseWriter, response *http.Response) error {
 	}
 
 	return nil
+}
+
+func debugf(format string, args ...interface{}) {
+	if Debug {
+		log.Printf(format, args...)
+	}
+}
+
+func logf(format string, args ...interface{}) {
+	log.Printf(format, args...)
 }

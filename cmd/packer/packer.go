@@ -20,7 +20,6 @@ func main() {
 	maxCountFlag := flag.Int("maxcount", 10, "Max items per pack")
 	repackFlag := flag.Int("repack", 20, "Repack after X% of a pack have been deleted")
 	debugFlag := flag.Bool("debug", false, "Enable debug mode")
-	quietFlag := flag.Bool("quiet", false, "Do not output anything")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -34,7 +33,6 @@ func main() {
 
 	forwardAddr := flag.Arg(0)
 
-	packer.Quiet = *quietFlag
 	packer.Debug = *debugFlag
 
 	packer, err := packer.NewPacker(&packer.Config{

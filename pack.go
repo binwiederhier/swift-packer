@@ -69,14 +69,13 @@ func (p *pack) packUpload() (*http.Response, error) {
 	upstreamRequest.Header = p.first.Header.Clone()
 	upstreamRequest.Header.Set("X-Object-Meta-Pack", strings.Join(meta, ","))
 
-	debugf("[group %s] PUT /v1/%s/%s/%s/%s %s \n", p.groupId, p.account, p.container, p.config.Prefix, p.packId)
 	upstreamResponse, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		return nil, err
 	}
 
-	debugf("[group %s] Finished uploading pack %s (group %s), len %d, count %d, status %s\n",
-		p.packId, p.groupId, p.size, len(p.parts), upstreamResponse.Status)
+	logf("PUT /v1/%s/%s/%s/%s type=initial len=%d count=%d status=%s\n",
+		p.account, p.container, p.config.Prefix, p.packId, p.size, len(p.parts), upstreamResponse.Status)
 
 	return upstreamResponse, nil
 }

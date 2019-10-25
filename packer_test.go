@@ -30,7 +30,7 @@ func TestPacker(t *testing.T) {
 	go http.ListenAndServe("127.0.0.1:22586", nil)
 
 	// Start packer
-	packer := NewPacker(&Config{
+	packer, _ := NewPacker(&Config{
 		ListenAddr:  "127.0.0.1:12586",
 		ForwardAddr: "127.0.0.1:22586",
 		MinSize:     50,
