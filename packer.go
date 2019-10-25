@@ -7,6 +7,8 @@ import (
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -20,12 +22,13 @@ type Packer interface {
 }
 
 type Config struct {
-	ForwardAddr string
-	ListenAddr  string
-	MinSize     int
-	MaxWait     time.Duration
-	MaxCount    int
-	Prefix      string
+	ForwardAddr     string
+	ListenAddr      string
+	MinSize         int
+	MaxWait         time.Duration
+	MaxCount        int
+	RepackThreshold int
+	Prefix          string
 }
 
 type packer struct {
@@ -40,6 +43,7 @@ var (
 	hexCharset                  = []rune("0123456789abcdef")
 	accountContainerObjectRegex = regexp.MustCompile(`^/v1/([^/]+)/([^/]+)/(.+)$`)
 	packItemRegex               = regexp.MustCompile(`^([^/]+)/([^/]+)/(\d+)$`)
+	itemRangeRegex              = regexp.MustCompile(`^(\d+)-(\d+)$`)
 )
 
 func NewPacker(config *Config) (Packer, error) {
@@ -241,7 +245,8 @@ func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) (int, erro
 		return 400, err
 	}
 
-	packUri := fmt.Sprintf("http://%s/v1/%s/%s/%s/%s", p.config.ForwardAddr, account, container, p.config.Prefix, packId)
+	packPath := fmt.Sprintf("%s/%s/%s/%s", account, container, p.config.Prefix, packId)
+	packUri := fmt.Sprintf("http://%s/v1/%s", p.config.ForwardAddr, packPath)
 	headRequest, err := http.NewRequest(http.MethodHead, packUri, nil)
 	if err != nil {
 		return 500, err
@@ -253,33 +258,168 @@ func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) (int, erro
 		return 500, err
 	}
 
+	packSize, err := strconv.Atoi(headResponse.Header.Get("Content-Length"))
+	if err != nil {
+		return 500, err
+	}
+
 	meta := headResponse.Header.Get("X-Object-Meta-Pack")
 	if meta == "" {
 		return 500, errors.New("Pack file does not contain X-Object-Meta-Pack header")
 	}
 
+	// Logically delete item
 	packMetaParts := strings.Split(meta, ",")
 	if itemId < 0 || itemId > len(packMetaParts)-1 {
 		return 400, errors.New("Invalid item ID")
 	}
 	packMetaParts[itemId] = ""
 
-	// Update X-Object-Meta-Pack (remove item range)
-	postRequest, err := http.NewRequest(http.MethodPost, packUri, nil)
-	if err != nil {
-		return 500, err
+	// Find out if X% of pack have been logically deleted, repack if it has
+	logicalPackSize := 0
+	for _, itemRange := range packMetaParts {
+		rangeParts := itemRangeRegex.FindStringSubmatch(itemRange)
+		if rangeParts != nil {
+			from, err := strconv.Atoi(rangeParts[1])
+			if err != nil {
+				return 500, err
+			}
+			to, err := strconv.Atoi(rangeParts[2])
+			if err != nil {
+				return 500, err
+			}
+			logicalPackSize += to - from + 1
+		}
 	}
 
-	postRequest.Header = r.Header.Clone()
-	postRequest.Header.Set("X-Object-Meta-Pack", strings.Join(packMetaParts, ","))
+	if float32(logicalPackSize) > float32(packSize) * (1 - float32(p.config.RepackThreshold)/100) {
+		// Update X-Object-Meta-Pack (remove item range)
+		postRequest, err := http.NewRequest(http.MethodPost, packUri, nil)
+		if err != nil {
+			return 500, err
+		}
 
-	postResponse, err := p.client.Do(postRequest)
-	if err != nil {
-		return 500, err
-	}
+		postRequest.Header = r.Header.Clone()
+		postRequest.Header.Set("X-Object-Meta-Pack", strings.Join(packMetaParts, ","))
 
-	if err := writeResponse(w, postResponse); err != nil {
-		debugf("Cannot write response: " + err.Error())
+		postResponse, err := p.client.Do(postRequest)
+		if err != nil {
+			return 500, err
+		}
+
+		if err := writeResponse(w, postResponse); err != nil {
+			debugf("Cannot write response: " + err.Error())
+		}
+	} else {
+		// Get all bytes for non-empty ranges from backend
+		getRequestRangeBytes := make([]string, 0)
+		for _, itemRange := range packMetaParts {
+			if itemRange != "" {
+				getRequestRangeBytes = append(getRequestRangeBytes, itemRange)
+			}
+		}
+
+		getRequest, err := http.NewRequest(http.MethodGet, packUri, nil)
+		if err != nil {
+			return 500, err
+		}
+
+		getRequest.Header = r.Header.Clone()
+		getRequest.Header.Set("Range", "bytes=" + strings.Join(getRequestRangeBytes,","))
+
+		getResponse, err := p.client.Do(getRequest)
+		if err != nil {
+			return 500, err
+		}
+
+		mediaType, params, err := mime.ParseMediaType(getResponse.Header.Get("Content-Type"))
+		if err != nil {
+			return 500, err
+		}
+
+		off := 0
+		body := make([]byte, logicalPackSize)
+		if strings.HasPrefix(mediaType, "multipart/") {
+			mr := multipart.NewReader(getResponse.Body, params["boundary"])
+			for off < len(body) {
+				p, err := mr.NextPart()
+				if err == io.EOF {
+					break
+				} else if err != nil {
+					return 500, err
+				}
+
+				for off < len(body) {
+					read, err := p.Read(body[off:])
+					if err == io.EOF {
+						off += read
+						break
+					} else if err != nil {
+						return 500, err
+					}
+					off += read
+				}
+			}
+		} else {
+			body, err = ioutil.ReadAll(getResponse.Body)
+			if err != nil {
+				return 500, err
+			}
+		}
+
+		if err := getResponse.Body.Close(); err != nil {
+			return 500, err
+		}
+
+		// Update pack meta data, and put the re-packed object back
+		// Examples:
+		//   X-Object-Meta-Pack: 0-131,,,393-524 -> 0-131,,,131-262
+		//   X-Object-Meta-Pack:,,10-20,,40-51 -> ,,0-10,,10-21
+		newPackMetaParts := make([]string, 0)
+		lastTo := 0
+		for _, itemRange := range packMetaParts {
+			rangeParts := itemRangeRegex.FindStringSubmatch(itemRange)
+			if rangeParts != nil {
+				from, err := strconv.Atoi(rangeParts[1])
+				if err != nil {
+					return 500, err
+				}
+				to, err := strconv.Atoi(rangeParts[2])
+				if err != nil {
+					return 500, err
+				}
+				length := to - from
+				if lastTo == 0 {
+					from = 0
+					to  = length
+				} else {
+					from = lastTo + 1
+					to = from + length
+				}
+				newPackMetaParts = append(newPackMetaParts, fmt.Sprintf("%d-%d", from, to))
+				lastTo = to
+			} else {
+				newPackMetaParts = append(newPackMetaParts, "")
+			}
+		}
+
+		putRequest, err := http.NewRequest(http.MethodPut, packUri, bytes.NewReader(body))
+		if err != nil {
+			return 500, err
+		}
+
+		putRequest.Header = r.Header.Clone()
+		putRequest.Header.Set("X-Object-Meta-Pack", strings.Join(newPackMetaParts, ","))
+
+		debugf("[group %s] PUT /v1/%s %s \n", packPath, strings.Join(newPackMetaParts, ","))
+		putResponse, err := p.client.Do(putRequest)
+		if err != nil {
+			return 500, err
+		}
+
+		if err := writeResponse(w, putResponse); err != nil {
+			debugf("Cannot write response: " + err.Error())
+		}
 	}
 
 	return 0, nil
@@ -396,12 +536,13 @@ func copyWithDefaults(config *Config) (*Config, error) {
 
 	// Create prepopulated config and override fields
 	newConfig := &Config{
-		ForwardAddr: config.ForwardAddr,
-		ListenAddr:  ":1234",
-		MinSize:     128 * 1024,
-		MaxWait:     100 * time.Millisecond,
-		MaxCount:    10,
-		Prefix:      ":pack",
+		ForwardAddr:     config.ForwardAddr,
+		ListenAddr:      ":1234",
+		MinSize:         128 * 1024,
+		MaxWait:         100 * time.Millisecond,
+		MaxCount:        10,
+		RepackThreshold: 20,
+		Prefix:          ":pack",
 	}
 
 	if config.ListenAddr != "" {
@@ -418,6 +559,10 @@ func copyWithDefaults(config *Config) (*Config, error) {
 
 	if config.MaxCount != 0 {
 		newConfig.MaxCount = config.MaxCount
+	}
+
+	if config.RepackThreshold != 0 {
+		newConfig.RepackThreshold = config.RepackThreshold
 	}
 
 	if config.Prefix != "" {

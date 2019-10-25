@@ -63,7 +63,7 @@ func (p *pack) packUpload() (*http.Response, error) {
 
 	meta := make([]string, 0)
 	for _, apart := range p.parts {
-		meta = append(meta, fmt.Sprintf("%d-%d", apart.offset, apart.offset + len(apart.data)))
+		meta = append(meta, fmt.Sprintf("%d-%d", apart.offset, apart.offset + len(apart.data) - 1))
 	}
 
 	upstreamRequest.Header = p.first.Header.Clone()
