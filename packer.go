@@ -67,25 +67,29 @@ func (p *packer) ListenAndServe() error {
 
 	server := &http.Server{
 		Addr:    p.config.ListenAddr,
-		Handler: p,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if status, err := p.serveHTTP(w, r); err != nil {
+				http.Error(w, err.Error(), status)
+			}
+		}),
 	}
 
 	return server.ListenAndServe()
 }
 
-func (p *packer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (p *packer) serveHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 	if r.Method == http.MethodPut && r.Header.Get("X-Allow-Pack") == "yes" {
-		p.handlePUT(w, r)
+		return p.handlePUT(w, r)
 	} else if r.Method == http.MethodGet {
-		p.handleGET(w, r)
+		return p.handleGET(w, r)
 	} else if r.Method == http.MethodDelete {
-		p.handleDELETE(w, r)
-	} else {
-		p.forwardRequest(w, r)
+		return p.handleDELETE(w, r)
 	}
+
+	return p.forwardRequest(w, r)
 }
 
-func (p *packer) handlePUT(w http.ResponseWriter, request *http.Request) {
+func (p *packer) handlePUT(w http.ResponseWriter, request *http.Request) (int, error) {
 	// Read up to buffer size into memory
 	buffer := p.buffers.Get().([]byte)
 	defer p.buffers.Put(buffer)
@@ -93,22 +97,19 @@ func (p *packer) handlePUT(w http.ResponseWriter, request *http.Request) {
 	read, err := p.readBuffer(buffer, request.Body)
 	if err != nil {
 		request.Body.Close() // Ignore error!
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	// Request is at least as large as buffer, forward upstream
 	if read == len(buffer) {
 		debugf("Incoming request %s too large for packing (> %d bytes), forwarding upstream\n", request.URL.Path, read)
 		request.Body = ioutil.NopCloser(io.MultiReader(bytes.NewReader(buffer[:read]), request.Body)) // FIXME leaking body
-		p.forwardRequest(w, request)
-		return
+		return p.forwardRequest(w, request)
 	}
 
 	// Request is fully in the buffer now, close request body and start packing
 	if err := request.Body.Close(); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	debugf("Incoming request %s fully read (%d bytes), appending to pack\n", request.URL.Path, read)
@@ -116,13 +117,15 @@ func (p *packer) handlePUT(w http.ResponseWriter, request *http.Request) {
 	// Determine pack group
 	groupId, err := p.parseGroupId(request)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+		return 400, err
 	}
 
 	// Find pack, append part to it
 	p.Lock()
 	apack, err := p.createOrGetPack(groupId, request)
+	if err != nil {
+		return 400, err
+	}
 
 	responseChan := make(chan *http.Response)
 	defer close(responseChan)
@@ -143,46 +146,42 @@ func (p *packer) handlePUT(w http.ResponseWriter, request *http.Request) {
 	if err := writeResponse(w, response); err != nil {
 		debugf("Cannot write response: " + err.Error())
 	}
+
+	return 0, nil
 }
 
-func (p *packer) handleGET(w http.ResponseWriter, r *http.Request) {
+func (p *packer) handleGET(w http.ResponseWriter, r *http.Request) (int, error) {
 	account, container, object, err := parseRequestParts(r.URL.Path)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+		return 400, err
 	}
 
 	packItemParts := packItemRegex.FindStringSubmatch(object)
 	if len(packItemParts) != 4 || packItemParts[1] != p.config.Prefix {
-		p.forwardRequest(w, r)
-		return
+		return p.forwardRequest(w, r)
 	}
 
 	packId := packItemParts[2]
 	itemId, err := strconv.Atoi(packItemParts[3])
 	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+		return 400, err
 	}
 
 	packUri := fmt.Sprintf("http://%s/v1/%s/%s/%s/%s", p.config.ForwardAddr, account, container, p.config.Prefix, packId)
 	headRequest, err := http.NewRequest(http.MethodHead, packUri, nil)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	headRequest.Header = r.Header.Clone()
 	headResponse, err := p.client.Do(headRequest)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	meta := headResponse.Header.Get("X-Object-Meta-Pack")
 	if meta == "" {
-		http.Error(w, "Pack file does not contain X-Object-Meta-Pack header", 500)
-		return
+		return 500, errors.New("Pack file does not contain X-Object-Meta-Pack header")
 	}
 
 	itemRange := ""
@@ -195,14 +194,12 @@ func (p *packer) handleGET(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if itemRange == "" {
-		http.Error(w, "Requested item does not exist in pack", 404)
-		return
+		return 404, errors.New("Requested item does not exist in pack")
 	}
 
 	getRequest, err := http.NewRequest(http.MethodGet, packUri, nil)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	getRequest.Header = r.Header.Clone()
@@ -210,8 +207,7 @@ func (p *packer) handleGET(w http.ResponseWriter, r *http.Request) {
 
 	getResponse, err := p.client.Do(getRequest)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	if getResponse.StatusCode == http.StatusPartialContent {
@@ -224,60 +220,54 @@ func (p *packer) handleGET(w http.ResponseWriter, r *http.Request) {
 	if err := writeResponse(w, getResponse); err != nil {
 		debugf("Cannot write response: " + err.Error())
 	}
+
+	return 0, nil
 }
 
-func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) {
+func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) (int, error) {
 	account, container, object, err := parseRequestParts(r.URL.Path)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+		return 400, err
 	}
 
 	packItemParts := packItemRegex.FindStringSubmatch(object)
 	if len(packItemParts) != 4 || packItemParts[1] != p.config.Prefix {
-		p.forwardRequest(w, r)
-		return
+		return p.forwardRequest(w, r)
 	}
 
 	packId := packItemParts[2]
 	itemId, err := strconv.Atoi(packItemParts[3])
 	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+		return 400, err
 	}
 
 	packUri := fmt.Sprintf("http://%s/v1/%s/%s/%s/%s", p.config.ForwardAddr, account, container, p.config.Prefix, packId)
 	headRequest, err := http.NewRequest(http.MethodHead, packUri, nil)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	headRequest.Header = r.Header.Clone()
 	headResponse, err := p.client.Do(headRequest)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	meta := headResponse.Header.Get("X-Object-Meta-Pack")
 	if meta == "" {
-		http.Error(w, "Pack file does not contain X-Object-Meta-Pack header", 500)
-		return
+		return 500, errors.New("Pack file does not contain X-Object-Meta-Pack header")
 	}
 
 	packMetaParts := strings.Split(meta, ",")
 	if itemId < 0 || itemId > len(packMetaParts)-1 {
-		http.Error(w, "Invalid pack item", 400)
-		return
+		return 400, errors.New("Invalid item ID")
 	}
 	packMetaParts[itemId] = ""
 
 	// Update X-Object-Meta-Pack (remove item range)
 	postRequest, err := http.NewRequest(http.MethodPost, packUri, nil)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	postRequest.Header = r.Header.Clone()
@@ -285,13 +275,14 @@ func (p *packer) handleDELETE(w http.ResponseWriter, r *http.Request) {
 
 	postResponse, err := p.client.Do(postRequest)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	if err := writeResponse(w, postResponse); err != nil {
 		debugf("Cannot write response: " + err.Error())
 	}
+
+	return 0, nil
 }
 
 func (p *packer) createOrGetPack(groupId string, first *http.Request) (*pack, error) {
@@ -345,15 +336,14 @@ func (p *packer) deletePack(groupId string) {
 	delete(p.packs, groupId)
 }
 
-func (p *packer) forwardRequest(w http.ResponseWriter, request *http.Request) {
+func (p *packer) forwardRequest(w http.ResponseWriter, request *http.Request) (int, error) {
 	forwardURL := request.URL
 	forwardURL.Scheme = "http"
 	forwardURL.Host = p.config.ForwardAddr
 
 	proxyRequest, err := http.NewRequest(request.Method, forwardURL.String(), request.Body)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	proxyRequest.Header = request.Header.Clone()
@@ -361,13 +351,14 @@ func (p *packer) forwardRequest(w http.ResponseWriter, request *http.Request) {
 
 	proxyResponse, err := p.client.Do(proxyRequest)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 500, err
 	}
 
 	if err := writeResponse(w, proxyResponse); err != nil {
 		debugf("Cannot write response to forwarded request: " + err.Error())
 	}
+
+	return 0, nil
 }
 
 func (p *packer) parseGroupId(request *http.Request) (string, error) {
@@ -409,7 +400,7 @@ func copyWithDefaults(config *Config) (*Config, error) {
 		ListenAddr:  ":1234",
 		MinSize:     128 * 1024,
 		MaxWait:     100 * time.Millisecond,
-		MaxCount:    50,
+		MaxCount:    10,
 		Prefix:      ":pack",
 	}
 
